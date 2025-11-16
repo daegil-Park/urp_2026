@@ -21,9 +21,6 @@ from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
-# from isaaclab.managers import SceneDataCfg
-
-# import nrs_ik_core
 
 from . import mdp
 
@@ -60,7 +57,7 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
     workpiece = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Workpiece",
         spawn=sim_utils.UsdFileCfg(
-            usd_path="/home/eunseop/isaac/isaac_save/flat_surface.usd"
+            usd_path="/home/eunseop/isaac/isaac_save/flat_surface_2.usd"
         ),
         init_state=AssetBaseCfg.InitialStateCfg(
             pos=(0.5, 0.0, 0.0),
@@ -134,14 +131,14 @@ class ObservationsCfg:
         joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
         joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
         
-        # grid_mask_state = ObsTerm(      # Grid Mask의 상태: Policy가 방문하지 않은 곳을 찾아가도록 유도
-        #     func=local_obs.grid_mask_state_obs,
-        #     params={
-        #         # "grid_mask": SceneEntityCfg("env", data_key="grid_mask"), 
-        #             # "grid_mask": SceneEntityCfg(name="workpiece", body_names=["grid_mask"]),
-        #         "grid_mask_history_len": 4
-        #     }
-        # )
+        grid_mask_state = ObsTerm(      # Grid Mask의 상태: Policy가 방문하지 않은 곳을 찾아가도록 유도
+            func=local_obs.grid_mask_state_obs,
+            params={
+                # "grid_mask": SceneEntityCfg("env", data_key="grid_mask"), 
+                    # "grid_mask": SceneEntityCfg(name="workpiece", body_names=["grid_mask"]),
+                "grid_mask_history_len": 4
+            }
+        )
 
         ee_pose_history = ObsTerm(
             func=local_obs.ee_pose_history,

@@ -27,7 +27,7 @@ def get_workpiece_size(workpiece):
         workpiece_prim = workpiece.prims[0]
         
         # Mesh Prim path 찾기: usd 파일에 따라 변경 필요
-        actual_mesh_prim = workpiece_prim.GetChild("flat_surface_6").GetChild("flat_surface_4").GetChild("Mesh")
+        actual_mesh_prim = workpiece_prim.GetChild("World").GetChild("flat_surface_5").GetChild("mesh_").GetChild("Mesh")
         if not actual_mesh_prim:
             raise ValueError("Mesh Prim not found at the final path.")
             
@@ -69,7 +69,7 @@ def get_workpiece_surface_height(workpiece, surface_offset=0.005):
         workpiece_prim = workpiece.prims[0]
         
         # Mesh Prim path 찾기: usd 파일에 따라 변경 필요
-        actual_mesh_prim = workpiece_prim.GetChild("flat_surface_6").GetChild("flat_surface_4").GetChild("Mesh")
+        actual_mesh_prim = workpiece_prim.GetChild("World").GetChild("flat_surface_5").GetChild("mesh_").GetChild("Mesh")
         if not actual_mesh_prim:
             raise ValueError("Mesh Prim not found at the final path.")
             
@@ -141,8 +141,7 @@ def coverage_reward(env, grid_size=0.02):
     # grid mask 초기화
     num_envs = ee_pos.shape[0]
     if not hasattr(env, "grid_mask"):
-        env.grid_mask = torch.zeros((num_envs, grid_x_num, grid_y_num),
-                                 dtype=torch.bool, device=env.device)
+        env.grid_mask = torch.zeros((num_envs, grid_x_num, grid_y_num), dtype=torch.bool, device=env.device)
         newly_visited = torch.zeros(num_envs, dtype=torch.float, device=env.device)
     else:
         previous_mask = env.grid_mask.clone()

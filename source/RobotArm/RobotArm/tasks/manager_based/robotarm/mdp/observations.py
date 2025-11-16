@@ -5,7 +5,17 @@ from __future__ import annotations
 import torch
 from isaaclab.assets import RigidObject
 from isaaclab.managers import SceneEntityCfg
-import numpy as np
+
+from RobotArm.tasks.manager_based.robotarm.mdp.rewards import get_workpiece_size
+
+import sys
+if "nrs_fk_core" not in sys.modules:
+    from nrs_fk_core import FKSolver
+else:
+    FKSolver = sys.modules["nrs_fk_core"].FKSolver
+
+
+fk_solver = FKSolver(tool_z=0.239, use_degrees=False)
 
 # 전역 버퍼 (env 별 히스토리 저장용)
 EE_HISTORY_BUFFER = None
@@ -15,18 +25,26 @@ EE_HISTORY_LEN = None
 def grid_mask_state_obs(env, grid_mask_history_len=4):
     """
     Workpiece의 Grid Mask 상태 관찰
-    Args:
-        env: IsaacLab 환경 인스턴스. env.grid_mask (torch.bool, shape: N x X x Y)를 사용
-        grid_mask_history_len (int): 관찰에 포함할 Grid Mask 과거 스텝 수
     """
+    workpiece = env.scene["workpiece"]
+    try:
+        wp_size_x, wp_size_y = get_workpiece_size(workpiece)
+    except Exception as e:
+        # USD Prim 경로가 아직 불안정하거나 Manager 초기화 과정에서 Workpiece Asset이 완전히 로드되지 않았을 수 있습니다.
+        # 이 경우, 하드코딩된 기본값 (0.5)을 사용합니다.
+        wp_size_x, wp_size_y = 0.5, 0.5
+        print(f"Workpiece size dynamic read failed in obs: {e}. Using default.") # 디버깅용
+
+    GRID_SIZE = 0.02
+    grid_x_num = int(wp_size_x / GRID_SIZE) # 동적으로 계산
+    grid_y_num = int(wp_size_y / GRID_SIZE)
+
+    # 2. env.grid_mask가 정의되지 않았다면 초기화
     if not hasattr(env, "grid_mask"):
-        GRID_SIZE = 0.02
-        WP_SIZE_X, WP_SIZE_Y = 0.5, 0.5 # rewards.py의 get_workpiece_size 기본값 사용
-        grid_x_num = int(WP_SIZE_X / GRID_SIZE) # 0.5 / 0.02 = 25
-        grid_y_num = int(WP_SIZE_Y / GRID_SIZE) # 0.5 / 0.02 = 25
-        
+        # 초기화: 모든 환경에 대해 Falses로 초기화
+        # env.grid_mask = torch.zeros((env.num_envs, grid_x_num, grid_y_num), dtype=torch.bool, device=env.device)
         total_dim = grid_x_num * grid_y_num * grid_mask_history_len
-        
+
         # Manager가 차원만 알 수 있도록 더미 텐서 반환
         return torch.zeros((env.num_envs, total_dim), device=env.device)
     
@@ -49,8 +67,7 @@ def grid_mask_state_obs(env, grid_mask_history_len=4):
     
     # 히스토리 업데이트: 가장 오래된 데이터 제거, 최신 데이터 추가
     env._grid_mask_history = torch.cat(
-        [env._grid_mask_history[:, 1:], new_mask_float_unsqueeze], 
-        dim=1
+        [env._grid_mask_history[:, 1:], new_mask_float_unsqueeze], dim=1
     )
 
     # 4. 관찰 벡터 형태로 평탄화 (Flatten)
