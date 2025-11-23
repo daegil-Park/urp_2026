@@ -148,6 +148,13 @@ class ObservationsCfg:
                 },
         )
 
+        # contact_forces = ObsTerm(
+        #     func=local_obs.get_contact_forces,
+        #     params={
+        #         "sensor_name": "ActionGraphContactSensor"
+        #     }
+        # )
+
         def __post_init__(self):
             self.enable_corruption = True
             self.concatenate_terms = True
@@ -170,6 +177,11 @@ class EventCfg:
         },
     )
 
+    reset_grid_mask = EventTerm(
+        func=mdp.reset_grid_mask,  # 1번에서 정의한 함수
+        mode="reset",
+    )
+
 
 @configclass
 class RewardsCfg:
@@ -178,24 +190,24 @@ class RewardsCfg:
     # 커버리지 증가 보상 및 중복 방문 패널티
     coverage = RewTerm(
         func=local_rew.coverage_reward,
-        weight=1.0,
+        weight=2.0,
         params={"grid_size": 0.02},
     )
     revisit_penalty = RewTerm(
         func=local_rew.revisit_penalty,
-        weight=-1.0,
+        weight=-0.5,
         params={"grid_size": 0.02},
     )
 
     # 안정성 (EE의 z 높이 및 자세)
     surface_proximity = RewTerm(
         func=local_rew.surface_proximity_reward,
-        weight=0.5,
+        weight=1.0,
         params={"asset_cfg": SceneEntityCfg("robot", body_names=EE_FRAME_NAME)},
     )
     ee_orientation_alignment = RewTerm(
         func=local_rew.ee_orientation_alignment,
-        weight=2.0,
+        weight=1.5,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=[EE_FRAME_NAME]),
             "target_axis": (0.0, 0.0, -1.0), # EE의 Z축이 월드 Z축과 평행하도록 (수직 폴리싱 가정)
@@ -212,7 +224,7 @@ class RewardsCfg:
     # 효율성
     time_efficiency = RewTerm(
         func=local_rew.time_efficiency_reward,
-        weight=0.5,
+        weight=1.0,
         params={"max_steps": 750},  # episode 길이에 맞춰 조정
     )
 
@@ -227,12 +239,9 @@ class TerminationsCfg:
     # task_success = DoneTerm(
     #     func=local_rew.coverage_completion_reward,
     #     params={
-    #         "grid_mask": SceneEntityCfg("reward", body_names=["grid_mask"]),
     #         "threshold": 0.95,
     #         "bonus_scale": 10.0,
-    #         # 95% 초과 시 함수는 0.0 초과의 값 반환 -> 0.001만 넘어도 종료되도록 설정
-    #         "minimum_value": 0.001 
-    #     }
+    #     },
     # )
 
 @configclass
@@ -270,14 +279,12 @@ class RobotarmEnvCfg(ManagerBasedRLEnvCfg):
     terminations: TerminationsCfg = TerminationsCfg()
     curriculum: CurriculumCfg = CurriculumCfg()
 
-    
-
     # Post initialization
     def __post_init__(self) -> None:
         """Post initialization."""
         # general settings
         self.decimation = 2
-        self.episode_length_s = 30.0
+        self.episode_length_s = 5.0
         # viewer settings
         self.viewer.eye = (3.5, 3.5, 3.5)
         # simulation settings

@@ -1,8 +1,3 @@
-# push test 2222
-
-
-# zzzzzzzzzzzzzzzzzzzzzzz
-
 from __future__ import annotations
 
 import torch
@@ -137,7 +132,8 @@ def coverage_reward(env, grid_size=0.02):
     엔드이펙터가 방문한 grid cell의 증가분을 계산해 coverage reward를 반환.
     """
     ee_pos, wp_size_x, wp_size_y, grid_x, grid_y, num_envs, grid_x_num, grid_y_num = ee_to_grid(env, grid_size=grid_size)
-
+    total_cells = grid_x_num * grid_y_num
+    
     # grid mask 초기화
     num_envs = ee_pos.shape[0]
     if not hasattr(env, "grid_mask"):
@@ -145,15 +141,91 @@ def coverage_reward(env, grid_size=0.02):
         newly_visited = torch.zeros(num_envs, dtype=torch.float, device=env.device)
     else:
         previous_mask = env.grid_mask.clone()
-        # 현재 위치 방문 표시
+        
+        # 현재 위치 방문 표시: 새로 방문한 셀 = 1, 재방문/미방문 셀 = 0
         indices = torch.arange(num_envs, device=env.device)
         env.grid_mask[indices, grid_x, grid_y] = True
-        # 커버리지 증가율 계산: 새로 방문한 셀 = 1, 재방문/미방문 셀 = 0
+        # 새로 방문한 셀 수
         newly_visited = (env.grid_mask.long() - previous_mask.long()).sum(dim=(1, 2)).float()
     
-    # coverage_ratio = grid_mask.view(num_envs, -1).float().mean(dim=1)
+    # 커버리지 비율 (0.0 ~ 1.0) 계산
+    current_covered_count = env.grid_mask.sum(dim=(1, 2)).float()
+    coverage_ratio = current_covered_count / total_cells
+
+    # exponential scaling 적용
+    exp_reward = newly_visited * (torch.exp(3.0 * coverage_ratio) - 1.0)
+
+    return exp_reward
+
+
+def revisit_penalty(env, grid_size=0.02):
+    """
+    이미 방문한 grid cell을 다시 방문하면 벌점.
+    last_ee_cell: 이전 step의 EE grid 위치 (num_envs, 2)
+    """
+    ee_pos, wp_size_x, wp_size_y, grid_x, grid_y, num_envs, grid_x_num, grid_y_num = ee_to_grid(env, grid_size=grid_size)
+
+    # grid_mask 초기화
+    if env.grid_mask is None:
+        return torch.zeros(env.num_envs, device=env.device)
     
-    return newly_visited
+    # 현재 EE 위치가 grid_mask에서 True인지 확인 (재방문 여부 확인)
+    indices = torch.arange(num_envs, device=env.device)
+    is_revisited = env.grid_mask[indices, grid_x, grid_y]
+    revisited = is_revisited.float()   # True -> 1.0, False -> 0.0
+
+    return -revisited
+
+
+# def coverage_completion_reward(env, threshold=0.95, bonus_scale=10.0):
+#     """
+#     surface coverage 비율이 threshold를 넘으면 bonus_scale 만큼의 보상 제공
+#     """
+#     workpiece = env.scene["workpiece"]
+
+#     GRID_SIZE = 0.02
+#     wp_size_x, wp_size_y = get_workpiece_size(workpiece)
+#     grid_x_num = int(wp_size_x / GRID_SIZE)
+#     grid_y_num = int(wp_size_y / GRID_SIZE)
+
+#     if not hasattr(env, "grid_mask"):
+#         print("Grid Mask not initialized; returning dummy tensor. (First run)")
+#         total_dim = grid_x_num * grid_y_num
+#         return torch.zeros((env.num_envs, total_dim), device=env.device)
+    
+#     num_envs = env.grid_mask.shape[0]
+#     # 현재 커버리지 비율 (0.0 ~ 1.0)
+#     completion = env.grid_mask.view(num_envs, -1).float().mean(dim=1)
+#     # 임계값(threshold)을 넘어선 부분만 추출
+#     over_threshold = torch.clamp(completion - threshold, min=0.0)
+
+#     # (1.0 - threshold)가 0에 가까우면 나눗셈이 불안정해질 수 있으므로 epsilon 추가
+#     remaining_range = 1.0 - threshold
+#     epsilon = 1e-6
+#     if remaining_range > epsilon:
+#         normalized_bonus_ratio = over_threshold / remaining_range
+#     else:
+#         # threshold가 거의 1.0인 경우, over_threshold가 0보다 크면 1.0을 반환
+#         normalized_bonus_ratio = (over_threshold > 0.0).float()
+    
+#     # 커버리지 100% 달성 시 bonus_scale 만큼의 보상
+#     return normalized_bonus_ratio * bonus_scale
+
+
+def reset_grid_mask(env, env_ids):
+    """
+    에피소드 리셋 시 env.grid_mask 텐서를 False(0)로 초기화합니다.
+    """
+    # grid_mask의 존재를 확인하고 초기화
+    if hasattr(env, "grid_mask"):
+        # 마스크를 0(False)으로 설정
+        env.grid_mask[env_ids] = False
+    
+    # Grid Mask 상태 관찰(obs)에서 사용하는 히스토리도 함께 초기화
+    if hasattr(env, "_grid_mask_history"):
+        env._grid_mask_history[env_ids] = 0.0
+
+    return {}
 
 
 def surface_proximity_reward(env, asset_cfg: SceneEntityCfg):
@@ -180,17 +252,8 @@ def ee_orientation_alignment(env, asset_cfg: SceneEntityCfg, target_axis=(0.0, 0
     ee_quat_w = ee_asset.data.body_quat_w[:, asset_cfg.body_ids[0], :]
     
     # 2. EE의 Z축(툴팁 방향) 월드 벡터 계산
-    # 쿼터니언을 이용하여 EE 로컬 Z축(0, 0, 1)을 월드 좌표계로 회전시킵니다.
-    # IsaacLab/OmniPVD에는 쿼터니언 회전 유틸리티가 있습니다. (예: isaaclab.utils.math.quat_apply)
-    # 여기서는 임시로 numpy 변환을 피하고 torch로 직접 구현하거나, 유틸리티를 가정합니다.
-    
-    # Workaround: Quat to Rotation Matrix (for conceptual clarity)
     rot_matrix = matrix_from_quat(ee_quat_w) # (num_envs, 3, 3)
-    
     # EE의 Z축 (로컬 (0, 0, 1))은 회전 행렬의 세 번째 열 벡터입니다.
-    # 단, UR10e의 툴팁 Z축 방향이 로컬 Z축이 아닐 수 있으므로, 실제 로봇 모델에 맞춰 조정해야 합니다.
-    # 여기서는 툴팁 축이 World Z (0, 0, 1)과 평행해야 한다고 가정하고,
-    # 로봇의 Z축(세 번째 열)을 봅니다.
     ee_z_axis_w = rot_matrix[:, :, 2] # shape: (num_envs, 3)
     
     # 3. 목표 축 텐서 생성
@@ -206,62 +269,9 @@ def ee_orientation_alignment(env, asset_cfg: SceneEntityCfg, target_axis=(0.0, 0
     return alignment_measure
 
 
-def revisit_penalty(env, grid_size=0.02):
-    """
-    이미 방문한 grid cell을 다시 방문하면 벌점.
-    last_ee_cell: 이전 step의 EE grid 위치 (num_envs, 2)
-    """
-    ee_pos, wp_size_x, wp_size_y, grid_x, grid_y, num_envs, grid_x_num, grid_y_num = ee_to_grid(env, grid_size=grid_size)
-
-    # grid_mask 초기화
-    if env.grid_mask is None:
-        return torch.zeros(env.num_envs, device=env.device)
-    
-    # 현재 EE 위치가 grid_mask에서 True인지 확인 (재방문 여부 확인)
-    indices = torch.arange(num_envs, device=env.device)
-    is_revisited = env.grid_mask[indices, grid_x, grid_y]
-    revisited = is_revisited.float()   # True -> 1.0, False -> 0.0
-
-    return -revisited
-
-
-def coverage_completion_reward(env, threshold=0.95, bonus_scale=10.0):
-    """
-    전체 surface coverage 비율에 따라 보너스 반환
-    """
-    if env.grid_mask is None:
-        return torch.zeros(env.num_envs, device=env.device)
-    
-    num_envs = env.grid_mask.shape[0]
-    # 현재 커버리지 비율 (0.0 ~ 1.0)
-    completion = env.grid_mask.view(num_envs, -1).float().mean(dim=1)
-    
-    # 임계값(threshold)을 넘어선 부분만 추출
-    over_threshold = torch.clamp(completion - threshold, min=0.0)
-    # 남은 완료 비율 (1 - threshold)로 나누어 다시 0.0 ~ 1.0 범위로 정규화
-    # (1.0 - threshold)가 0에 가까우면 나눗셈이 불안정해질 수 있으므로 epsilon 추가
-    remaining_range = 1.0 - threshold
-    epsilon = 1e-6
-    if remaining_range > epsilon:
-        normalized_bonus_ratio = over_threshold / remaining_range
-    else:
-        # threshold가 거의 1.0인 경우, over_threshold가 0보다 크면 1.0을 반환
-        normalized_bonus_ratio = (over_threshold > 0.0).float()
-    
-    # 커버리지 100% 달성 시 bonus_scale 만큼의 보상
-    return normalized_bonus_ratio * bonus_scale
-
-
 def time_efficiency_reward(env, max_steps: int = 1000):
     """
     시간 효율성에 대한 보상함수
-    Shorter episodes / fewer steps get higher reward.
-    
-    Args:
-        env: IsaacLab environment instance
-        max_steps: maximum steps in the episode for normalization
-    Returns:
-        reward: torch.Tensor of shape (num_envs,)
     """
     # 현재 step
     current_step_tensor = env.episode_length_buf.to(torch.float32)

@@ -27,43 +27,42 @@ def grid_mask_state_obs(env, grid_mask_history_len=4):
     Workpiece의 Grid Mask 상태 관찰
     """
     workpiece = env.scene["workpiece"]
-    try:
-        wp_size_x, wp_size_y = get_workpiece_size(workpiece)
-    except Exception as e:
-        # USD Prim 경로가 아직 불안정하거나 Manager 초기화 과정에서 Workpiece Asset이 완전히 로드되지 않았을 수 있습니다.
-        # 이 경우, 하드코딩된 기본값 (0.5)을 사용합니다.
-        wp_size_x, wp_size_y = 0.5, 0.5
-        print(f"Workpiece size dynamic read failed in obs: {e}. Using default.") # 디버깅용
-
+    
     GRID_SIZE = 0.02
-    grid_x_num = int(wp_size_x / GRID_SIZE) # 동적으로 계산
+    wp_size_x, wp_size_y = get_workpiece_size(workpiece)
+    grid_x_num = int(wp_size_x / GRID_SIZE)
     grid_y_num = int(wp_size_y / GRID_SIZE)
 
-    # 2. env.grid_mask가 정의되지 않았다면 초기화
+    # env.grid_mask가 정의되지 않았다면 초기화
     if not hasattr(env, "grid_mask"):
-        # 초기화: 모든 환경에 대해 Falses로 초기화
-        # env.grid_mask = torch.zeros((env.num_envs, grid_x_num, grid_y_num), dtype=torch.bool, device=env.device)
+        print("Grid Mask not initialized; returning dummy tensor. (First run)")
         total_dim = grid_x_num * grid_y_num * grid_mask_history_len
-
-        # Manager가 차원만 알 수 있도록 더미 텐서 반환
         return torch.zeros((env.num_envs, total_dim), device=env.device)
     
+    # 현재 Grid Mask 상태 가져오기
     current_mask_float = env.grid_mask.float()
     is_reset = (env.episode_length_buf == 0).any()
     
+    # 커버리지 비율 (0~100) 계산
+    total_grids = grid_x_num * grid_y_num
+    covered_counts = torch.sum(current_mask_float, dim=[1, 2])
+    coverage_percentages = (covered_counts / total_grids) * 100
+    first_env_coverage = coverage_percentages[0].item()
+    print(f"Current Workpiece Coverage: {first_env_coverage:.2f}% (Total grids: {total_grids}, Covered: {covered_counts[0].item():.0f})")
+    
+    # 히스토리 버퍼 초기화
     if not hasattr(env, "_grid_mask_history") or is_reset:
-        # 히스토리 텐서의 shape: (num_envs, history_len, grid_x_num, grid_y_num)
         history_shape = (env.num_envs, grid_mask_history_len) + current_mask_float.shape[1:]
-        # 초기화: history_len 만큼 현재 Grid Mask로 채우거나 (리셋이 아닌 경우), 0으로 채웁니다.
+        # 초기화: history_len 만큼 현재 0 or Grid Mask로 채우기
         if is_reset and hasattr(env, "_grid_mask_history"):
-             # 에피소드 리셋 시 0으로 초기화
+            # 에피소드 리셋 시 0으로 초기화
             env._grid_mask_history = torch.zeros(history_shape, dtype=torch.float, device=env.device)
         else:
             # 환경 시작 시 초기화
             env._grid_mask_history = torch.stack([current_mask_float] * grid_mask_history_len, dim=1)
         
-    # 2. 새로운 Grid Mask 상태를 히스토리 큐에 추가 (FIFO)
-    new_mask_float_unsqueeze = current_mask_float.unsqueeze(1) 
+    # 새로운 Grid Mask 상태를 히스토리 큐에 추가 (FIFO)
+    new_mask_float_unsqueeze = current_mask_float.unsqueeze(1)
     
     # 히스토리 업데이트: 가장 오래된 데이터 제거, 최신 데이터 추가
     env._grid_mask_history = torch.cat(
@@ -134,3 +133,21 @@ def quat_to_euler(quat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch
     yaw = torch.atan2(t3, t4)
 
     return roll, pitch, yaw
+
+
+def get_contact_forces(env, sensor_name="contact_forces"):
+    """Mean contact wrench [Fx, Fy, Fz, 0, 0, 0]"""
+    sensor = env.scene.sensors[sensor_name]
+    forces_w = sensor.data.net_forces_w
+    mean_force = torch.mean(forces_w, dim=1)
+    zeros_torque = torch.zeros_like(mean_force)
+    contact_wrench = torch.cat([mean_force, zeros_torque], dim=-1)
+
+    step = int(env.common_step_counter)
+    if step % 100 == 0:
+        fx, fy, fz = mean_force[0].tolist()
+        print(f"[ContactSensor DEBUG] Step {step}: Fx={fx:.3f}, Fy={fy:.3f}, Fz={fz:.3f}")
+
+    return contact_wrench
+
+
