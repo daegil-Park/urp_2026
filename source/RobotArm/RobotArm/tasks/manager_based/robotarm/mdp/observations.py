@@ -6,15 +6,8 @@ import torch
 from isaaclab.assets import RigidObject
 from isaaclab.managers import SceneEntityCfg
 
-from RobotArm.tasks.manager_based.robotarm.mdp.rewards import get_workpiece_size
 
-import sys
-if "nrs_fk_core" not in sys.modules:
-    from nrs_fk_core import FKSolver
-else:
-    FKSolver = sys.modules["nrs_fk_core"].FKSolver
-
-fk_solver = FKSolver(tool_z=0.239, use_degrees=False)
+from RobotArm.tasks.manager_based.robotarm.mdp.rewards import get_workpiece_size, get_ee_pose
 
 
 # 전역 버퍼 (env 별 히스토리 저장용)
@@ -90,13 +83,8 @@ def ee_pose_history(env, asset_cfg: SceneEntityCfg, history_len: int = 5) -> tor
     """
     global EE_HISTORY_BUFFER, EE_HISTORY_LEN
 
-    asset: RigidObject = env.scene[asset_cfg.name]
-    ee_pos = asset.data.body_pos_w[:, asset_cfg.body_ids[0]]  # (num_envs, 3)
-    ee_quat = asset.data.body_quat_w[:, asset_cfg.body_ids[0]]  # (num_envs, 4)
-
-    # quaternion → roll, pitch, yaw 변환
-    roll, pitch, yaw = quat_to_euler(ee_quat)
-    ee_pose = torch.cat([ee_pos, torch.stack([roll, pitch, yaw], dim=-1)], dim=-1)
+    # ee_pose: (num_envs, 6) [x, y, z, roll, pitch, yaw]
+    ee_pose = get_ee_pose(env, asset_name="robot") # (num_envs, 6)
 
     # 초기화
     if EE_HISTORY_BUFFER is None or EE_HISTORY_LEN != history_len:
@@ -112,41 +100,17 @@ def ee_pose_history(env, asset_cfg: SceneEntityCfg, history_len: int = 5) -> tor
     return EE_HISTORY_BUFFER.reshape(env.num_envs, history_len * 6)
 
 
-def quat_to_euler(quat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Quaternion → Euler angles (roll, pitch, yaw)."""
-    w, x, y, z = quat.unbind(dim=-1)
+# def get_contact_forces(env, sensor_name="contact_forces"):
+#     """Mean contact wrench [Fx, Fy, Fz, 0, 0, 0]"""
+#     sensor = env.scene.sensors[sensor_name]
+#     forces_w = sensor.data.net_forces_w
+#     mean_force = torch.mean(forces_w, dim=1)
+#     zeros_torque = torch.zeros_like(mean_force)
+#     contact_wrench = torch.cat([mean_force, zeros_torque], dim=-1)
 
-    # roll (x축 회전)
-    t0 = +2.0 * (w * x + y * z)
-    t1 = +1.0 - 2.0 * (x * x + y * y)
-    roll = torch.atan2(t0, t1)
+#     step = int(env.common_step_counter)
+#     if step % 100 == 0:
+#         fx, fy, fz = mean_force[0].tolist()
+#         print(f"[ContactSensor DEBUG] Step {step}: Fx={fx:.3f}, Fy={fy:.3f}, Fz={fz:.3f}")
 
-    # pitch (y축 회전)
-    t2 = +2.0 * (w * y - z * x)
-    t2 = torch.clamp(t2, -1.0, 1.0)
-    pitch = torch.asin(t2)
-
-    # yaw (z축 회전)
-    t3 = +2.0 * (w * z + x * y)
-    t4 = +1.0 - 2.0 * (y * y + z * z)
-    yaw = torch.atan2(t3, t4)
-
-    return roll, pitch, yaw
-
-
-def get_contact_forces(env, sensor_name="contact_forces"):
-    """Mean contact wrench [Fx, Fy, Fz, 0, 0, 0]"""
-    sensor = env.scene.sensors[sensor_name]
-    forces_w = sensor.data.net_forces_w
-    mean_force = torch.mean(forces_w, dim=1)
-    zeros_torque = torch.zeros_like(mean_force)
-    contact_wrench = torch.cat([mean_force, zeros_torque], dim=-1)
-
-    step = int(env.common_step_counter)
-    if step % 100 == 0:
-        fx, fy, fz = mean_force[0].tolist()
-        print(f"[ContactSensor DEBUG] Step {step}: Fx={fx:.3f}, Fy={fy:.3f}, Fz={fz:.3f}")
-
-    return contact_wrench
-
-
+#     return contact_wrench

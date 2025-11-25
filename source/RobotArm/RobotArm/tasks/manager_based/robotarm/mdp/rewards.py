@@ -4,11 +4,18 @@ import torch
 from typing import TYPE_CHECKING
 from isaaclab.assets import RigidObject
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import matrix_from_quat, combine_frame_transforms, quat_error_magnitude, quat_mul
+from isaaclab.utils.math import matrix_from_euler, combine_frame_transforms, quat_error_magnitude, quat_mul
 from pxr import UsdGeom
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
+
+import sys
+if "nrs_fk_core" not in sys.modules:
+    from nrs_fk_core import FKSolver
+else:
+    FKSolver = sys.modules["nrs_fk_core"].FKSolver
+
 
 from RobotArm.robots.ur10e_w_spindle import *
 
@@ -62,14 +69,43 @@ def get_workpiece_surface_height(workpiece, surface_offset=0.005):
         workpiece_z_size = max(zs) - min(zs)
         target_height = workpiece_z_size + surface_offset
         return target_height
-    
+
+
+def get_ee_pose(env: "ManagerBasedRLEnv", asset_name: str = "robot"):
+    """
+    Returns end-effector pose (x, y, z, roll, pitch, yaw)
+    -----------------------------------------------------
+    - 현재 로봇의 joint 상태(q1~q6)를 불러와서
+      FKSolver를 이용해 FK 계산 수행
+    - FK 결과는 torch.Tensor (num_envs, 6) 형태로 반환
+    """
+    robot = env.scene[asset_name]
+    q = robot.data.joint_pos[:, :6]  # (num_envs, 6)
+    num_envs = q.shape[0]
+
+    fk_solver = FKSolver(tool_z=0.239, use_degrees=False)
+    ee_pose_list = []
+
+    for i in range(num_envs):
+        q_np = q[i].cpu().numpy().astype(float)
+        ok, pose = fk_solver.compute(q_np, as_degrees=False)
+        if not ok:
+            ee_pose_list.append([float('nan')]*6)
+        else:
+            ee_pose_list.append([pose.x, pose.y, pose.z, pose.r, pose.p, pose.yaw])
+
+    ee_pose = torch.tensor(ee_pose_list, dtype=torch.float32, device=q.device)
+    assert ee_pose.ndim == 2 and ee_pose.shape[1] == 6, f"[EE_POSE] Invalid shape: {ee_pose.shape}"
+
+    return ee_pose
+
 
 def ee_to_grid(env, ee_frame_name=EE_FRAME_NAME, grid_size=0.02):
     """
     EE 좌표를 grid 좌표로 변환
     """
-    ee_index = env.scene["robot"].body_names.index(ee_frame_name)
-    ee_pos = env.scene["robot"].data.body_pos_w[:, ee_index]    # forward kinematics로 수정 필요
+    ee_pose = get_ee_pose(env, asset_name="robot") 
+    ee_pos = ee_pose[:, :3] # 위치 (x, y, z)만 사용
 
     workpiece = env.scene["workpiece"]
     workpiece_pos_tensor, _ = workpiece.get_world_poses()
@@ -207,9 +243,8 @@ def reset_grid_mask(env, env_ids):
 
 
 def surface_proximity_reward(env, asset_cfg: SceneEntityCfg):
-    # 엔드이펙터(EE)의 현재 위치
-    asset = env.scene[asset_cfg.name]
-    ee_z = asset.data.body_pos_w[:, asset_cfg.body_ids[0], 2]
+    ee_pose = get_ee_pose(env, asset_name="robot") 
+    ee_z = ee_pose[:, 2]
 
     # workpiece의 높이(평면 가정)
     workpiece = env.scene["workpiece"]
@@ -225,23 +260,19 @@ def ee_orientation_alignment(env, asset_cfg: SceneEntityCfg, target_axis=(0.0, 0
     엔드이펙터(EE)의 Z축이 월드 좌표계의 목표 축(Target Axis)과 정렬되도록 보상을 제공
     (폴리싱 작업에서 Workpiece 표면에 수직을 유지하기 위함)
     """
-    # 1. EE의 월드 회전(쿼터니언) 가져오기
-    ee_asset = env.scene[asset_cfg.name]
-    ee_quat_w = ee_asset.data.body_quat_w[:, asset_cfg.body_ids[0], :]
+    ee_pose = get_ee_pose(env, asset_name="robot") 
+    roll, pitch, yaw = ee_pose[:, 3], ee_pose[:, 4], ee_pose[:, 5]
     
-    # 2. EE의 Z축(툴팁 방향) 월드 벡터 계산
-    rot_matrix = matrix_from_quat(ee_quat_w) # (num_envs, 3, 3)
-    # EE의 Z축 (로컬 (0, 0, 1))은 회전 행렬의 세 번째 열 벡터입니다.
-    ee_z_axis_w = rot_matrix[:, :, 2] # shape: (num_envs, 3)
+    # 엔드이펙터 Z축 벡터 계산
+    ee_z_axis_w = matrix_from_euler(roll, pitch, yaw) # shape: (num_envs, 3)
     
-    # 3. 목표 축 텐서 생성
+    # 목표 축
     target_axis_t = torch.tensor(target_axis, dtype=ee_z_axis_w.dtype, device=env.device).unsqueeze(0).repeat(env.num_envs, 1)
     
-    # 4. 정렬 보상 계산 (코사인 유사도 사용)
-    # EE Z축 벡터와 목표 축 벡터 간의 내적 (Dot product)을 계산합니다.
+    # 내적(Dot product) 계산: alignment_measure = cos(theta)
     alignment_measure = torch.abs(torch.sum(ee_z_axis_w * target_axis_t, dim=1))
     
-    # 5. 보상 반환: 1에 가까울수록 높은 보상
+    # 보상: 1에 가까울수록 높은 보상
     return alignment_measure
 
 

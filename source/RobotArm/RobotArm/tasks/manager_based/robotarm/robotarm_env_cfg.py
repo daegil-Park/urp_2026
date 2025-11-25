@@ -128,8 +128,8 @@ class ObservationsCfg:
         """Observations for policy group."""
 
         # observation terms (order preserved)
-        joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
-        joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
+        # joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
+        # joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
         
         grid_mask_state = ObsTerm(      # Grid Mask의 상태: Policy가 방문하지 않은 곳을 찾아가도록 유도
             func=local_obs.grid_mask_state_obs,
@@ -141,8 +141,7 @@ class ObservationsCfg:
         ee_pose_history = ObsTerm(
             func=local_obs.ee_pose_history,
             params={
-                "asset_cfg": SceneEntityCfg("robot", body_names=[EE_FRAME_NAME]),
-                "history_len": 50
+                "history_len": 10
                 },
         )
 

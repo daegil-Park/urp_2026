@@ -1,0 +1,20 @@
+{
+    "python.autoComplete.extraPaths": [
+        "/home/eunseop/nrs_lab2/source",
+        "/home/eunseop/isaac/IsaacLab/source",
+        "/home/eunseop/isaac/isaac-sim-5.0.0/exts",
+        "/home/eunseop/isaac/isaac-sim-5.0.0/exts/omni.isaac.core",
+        "/home/eunseop/isaac/isaac-sim-5.0.0/python",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/eunseop/nrs_lab2/source",
+        "/home/eunseop/isaac/IsaacLab/source",
+        "/home/eunseop/isaac/isaac-sim-5.0.0/exts",
+        "/home/eunseop/isaac/isaac-sim-5.0.0/exts/omni.isaac.core",
+        "/home/eunseop/isaac/isaac-sim-5.0.0/python",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ]
+}
