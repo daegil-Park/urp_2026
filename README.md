@@ -4,6 +4,7 @@
 UR10e 로봇 암이 workpiece와 상호작용하며 작업을 수행하도록 학습하는 것을 목표로 합니다.
 학습 및 평가에는 `skrl` 강화학습 프레임워크를 사용합니다.
 <br />
+<br />
 
 ---
 <br />
@@ -106,25 +107,24 @@ World
 보상 함수, 종료 조건, 로깅 및 각종 유틸리티 함수들을 설명합니다.
 <br />
 <br />
-## 보상 함수 (Reward Functions)
+### 보상 함수 (Reward Functions)
 
-### `coverage_reward(env, exp_scale=5.0)`
+`coverage_reward(env, exp_scale=5.0)`
 - 엔드이펙터가 방문한 **grid cell coverage 증가량**을 기반으로 보상 계산
 - workpiece 영역을 grid로 분할하고 방문 여부를 `grid_mask`로 관리
 - 전체 coverage 비율에 **지수 스케일링(exponential scaling)** 적용
 - coverage 진행 상황을 CSV 파일로 로깅
 
 
-### `ee_movement_reward(env, max_movement=0.05)`
+`ee_movement_reward(env, max_movement=0.05)`
 - 엔드이펙터의 이동 거리에 비례한 보상
 - 로봇이 정지한 상태에 머무르는 정책을 방지
 - 과도한 움직임 보상을 방지하기 위해 이동 거리를 클리핑
 
-### `out_of_bounds_penalty(env)`
+`out_of_bounds_penalty(env)`
 - 엔드이펙터가 workpiece의 XY 범위를 벗어났을 경우 패널티 부여
 - 이탈 횟수를 누적하여 **반복 이탈 시 패널티가 점점 증가**
 - 작업 영역 내에서의 안정적인 탐색을 유도
-
 
 ### `revisit_penalty(env)`
 - 이전 step 대비 coverage가 증가하지 않았을 경우 패널티 부여
@@ -148,9 +148,9 @@ World
 - 엔드이펙터가 workpiece 중심에 가까울수록 높은 보상
 - 작업 영역 가장자리로 벗어나는 것을 방지하는 자석 형태의 보상
 <br />
-<br />
-## 종료 조건 (Termination Condition)
-### `check_coverage_success(env)`
+
+### 종료 조건 (Termination Condition)
+`check_coverage_success(env)`
 - 전체 workpiece grid 중 **95% 이상 커버 시 성공으로 판단**
 - 성공 여부를 boolean tensor로 반환하여 episode 종료 조건에 사용
 <br />
@@ -165,8 +165,8 @@ World
 - 특정 환경의 coverage 비율과 step 정보를 CSV에 기록
 - 학습 중 coverage 진행 상황 분석용
 <br />
-<br />
-## 기타 유틸리티 함수
+
+### 기타 유틸리티 함수
 
 ### `get_workpiece_vertices(workpiece)`
 - USD Mesh에서 workpiece의 vertex 좌표를 추출
