@@ -18,8 +18,8 @@ Run a trained policy using:
 ```bash
 ~/IsaacLab/isaaclab.sh -p ~/RobotArm/scripts/skrl/play.py --task Template-Robotarm-v0
 ```
- <br />
- 
+<br />
+<br />
 ## Robot Model Configuration
 The UR10e robot model is loaded from a USD file.
 You can change the robot model path in the following file:
@@ -37,8 +37,8 @@ UR10E_USD_PATH = "/home/eunseop/isaac/isaac_save/ur10e_tuning2.usd"
 ```
 
 Update the UR10E_USD_PATH variable to use a different UR10e USD model.
- <br />
-
+<br />
+<br />
 ## Workpiece Configuration
 The workpiece is defined as a USD asset in the environment configuration.
 
@@ -60,8 +60,8 @@ workpiece = AssetBaseCfg(
 ```
 
 Change the usd_path to load a different workpiece model.
-
-
+<br />
+<br />
 ## Mesh Path Change for Reward Computation
 The **mesh prim path** must match the structure of the loaded USD file.
 
@@ -100,8 +100,8 @@ World
      └── mesh_
          └── Mesh
 ```
- <br />
-
+<br />
+<br />
 ## Notes
 When changing the robot USD or workpiece USD, make sure to:
 - Update the USD path in the corresponding configuration file
