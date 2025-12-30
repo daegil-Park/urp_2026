@@ -101,7 +101,7 @@ World
 <br />
 
 ## 보상 및 유틸리티 함수
-본 섹션에서는 coverage 기반 강화학습을 위해 사용되는 보상 함수, 종료 조건, 로깅 및 각종 유틸리티 함수들을 설명합니다.
+본 섹션에서는 reward.py 파일 내에 정의된 보상 함수, 종료 조건, 로깅 및 각종 유틸리티 함수들을 설명합니다.
 <br />
 <br />
 ### 보상 함수 (Reward Functions)
@@ -196,7 +196,7 @@ World
 <br />
 
 ## 관찰 함수 (Observation Functions)
-본 섹션에서는 강화학습에 사용되는 관찰 함수들을 설명합니다.
+본 섹션에서는 observation.py 파일 내에 정의된 관찰 함수들을 설명합니다.
 
 `grid_mask_state_obs(env, grid_mask_history_len=4)`
 - Workpiece 영역을 grid로 나눈 뒤 **방문 상태(grid mask)** 를 관찰값으로 제공
