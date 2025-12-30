@@ -94,8 +94,8 @@ World
 ## 주의사항
 - 로봇 USD 변경 시 모델 경로 수정
 - Workpiece USD 변경 시:
- - usd_path 수정
- - rewards.py 내 mesh prim 경로 수정
+   usd_path 수정
+   rewards.py 내 mesh prim 경로 수정
 - 잘못된 mesh 경로는 reward 계산 오류를 유발할 수 있음
 <br />
 
@@ -103,8 +103,7 @@ World
 <br />
 
 ## 보상 및 유틸리티 함수
-본 섹션에서는 coverage 기반 강화학습을 위해 사용되는  
-보상 함수, 종료 조건, 로깅 및 각종 유틸리티 함수들을 설명합니다.
+본 섹션에서는 coverage 기반 강화학습을 위해 사용되는 보상 함수, 종료 조건, 로깅 및 각종 유틸리티 함수들을 설명합니다.
 <br />
 <br />
 ### 보상 함수 (Reward Functions)
