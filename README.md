@@ -126,25 +126,25 @@ World
 - 이탈 횟수를 누적하여 **반복 이탈 시 패널티가 점점 증가**
 - 작업 영역 내에서의 안정적인 탐색을 유도
 
-### `revisit_penalty(env)`
+`revisit_penalty(env)`
 - 이전 step 대비 coverage가 증가하지 않았을 경우 패널티 부여
 - 이미 방문한 grid cell을 반복 방문하는 행동 억제
 - 중복 방문 횟수에 따라 패널티가 누적 증가
 
-### `surface_proximity_reward(env)`
+`surface_proximity_reward(env)`
 - 엔드이펙터의 Z 위치가 workpiece 표면 높이에 가까울수록 높은 보상
 - 일정 오차 범위(5cm)는 허용하여 안정적인 표면 추종 유도
 
-### `ee_orientation_alignment(env, target_axis=(0,0,-1))`
+`ee_orientation_alignment(env, target_axis=(0,0,-1))`
 - 엔드이펙터의 Z축 방향이 목표 축과 정렬되도록 유도
 - 내적(dot product)을 사용해 정렬 정도를 계산
 - EE 자세 정렬을 통한 작업 안정성 확보
 
-### `time_efficiency_reward(env, max_steps=1000)`
+`time_efficiency_reward(env, max_steps=1000)`
 - 에피소드 진행 시간이 짧을수록 높은 보상
 - 빠른 task 수행을 유도하는 시간 효율성 보상
 
-### `distance_to_workpiece_reward(env)`
+`distance_to_workpiece_reward(env)`
 - 엔드이펙터가 workpiece 중심에 가까울수록 높은 보상
 - 작업 영역 가장자리로 벗어나는 것을 방지하는 자석 형태의 보상
 <br />
@@ -154,43 +154,43 @@ World
 - 전체 workpiece grid 중 **95% 이상 커버 시 성공으로 판단**
 - 성공 여부를 boolean tensor로 반환하여 episode 종료 조건에 사용
 <br />
-<br />
-## 로깅 유틸리티 (Logging Utilities)
 
-### `init_coverage_logger()`
+### 로그 저장
+
+`init_coverage_logger()`
 - coverage 기록을 저장할 CSV 파일 초기화
 - 기존 파일이 있으면 삭제 후 헤더 작성
 
-### `log_coverage_data(env, coverage_ratio)`
+`log_coverage_data(env, coverage_ratio)`
 - 특정 환경의 coverage 비율과 step 정보를 CSV에 기록
 - 학습 중 coverage 진행 상황 분석용
 <br />
 
 ### 기타 유틸리티 함수
 
-### `get_workpiece_vertices(workpiece)`
+`get_workpiece_vertices(workpiece)`
 - USD Mesh에서 workpiece의 vertex 좌표를 추출
 - USD 내부 prim 구조에 따라 mesh 경로 수정 필요
 
-### `get_workpiece_size(workpiece)`
+`get_workpiece_size(workpiece)`
 - workpiece의 X, Y 크기를 vertex 좌표 기반으로 계산
 - 실패 시 기본 크기(0.5 x 0.5) 사용
 
-### `get_workpiece_surface_height(workpiece, surface_offset=0.0)`
+`get_workpiece_surface_height(workpiece, surface_offset=0.0)`
 - workpiece 표면의 월드 Z 좌표 계산
 - surface offset을 적용해 EE 목표 높이 설정 가능
 
-### `get_ee_pose(env, asset_name="robot")`
+`get_ee_pose(env, asset_name="robot")`
 - 로봇 joint 상태를 기반으로 FK 계산 수행
 - 엔드이펙터의 월드 좌표계 기준
   `(x, y, z, roll, pitch, yaw)` 반환
 - FKSolver와 Isaac Lab body state를 함께 사용
 
-### `ee_to_grid(env)`
+`ee_to_grid(env)`
 - 엔드이펙터의 월드 좌표를 workpiece 기준 grid 좌표로 변환
 - coverage 계산을 위한 grid index `(grid_x, grid_y)` 반환
 
-### `reset_grid_mask(env, env_ids)`
+`reset_grid_mask(env, env_ids)`
 - 에피소드 리셋 시 grid_mask 및 관련 누적 변수 초기화
 - coverage, revisit, out-of-bounds 카운터 리셋
 <br />
