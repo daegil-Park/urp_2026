@@ -3,108 +3,106 @@
 
 from __future__ import annotations
 import torch
-from isaaclab.assets import RigidObject
 from isaaclab.managers import SceneEntityCfg
+from RobotArm.tasks.manager_based.robotarm.mdp.rewards import get_ee_pose # rewards에서 EE 위치 가져오는 함수 재사용
+import RobotArm.tasks.manager_based.robotarm.mdp.path_manager as pm # 경로 매니저 import
 
-
-from RobotArm.tasks.manager_based.robotarm.mdp.rewards import get_workpiece_size, get_ee_pose
-
-
-# 전역 버퍼 (env 별 히스토리 저장용)
+# 전역 버퍼 (속도/가속도 추정을 위한 히스토리 저장용)
 EE_HISTORY_BUFFER = None
 EE_HISTORY_LEN = None
-GRID_SIZE = 0.1
+# observations_1.py 수정 부분
 
-def grid_mask_state_obs(env, grid_mask_history_len=4):
+
+def path_tracking_obs(env):
     """
-    Workpiece의 Grid Mask 상태 관찰
+    [핵심] 경로 추종 및 폴리싱을 위한 관측 함수
+    
+    Returns:
+        obs (Tensor): [위치오차(3), 자세오차(3), 현재힘(1), 현재속도(6)] 등을 포함한 벡터
     """
-    if not hasattr(env, "grid_x_num"):
-        workpiece = env.scene["workpiece"]
-        try:
-            env.wp_size_x, env.wp_size_y = get_workpiece_size(workpiece)
-        except Exception as e:
-            env.wp_size_x, env.wp_size_y = 0.5, 0.5
-            print(f"Workpiece size dynamic read failed in obs: {e}. Using default.")
-
-        wp_size_x_t = torch.tensor(env.wp_size_x, device=env.device)
-        wp_size_y_t = torch.tensor(env.wp_size_y, device=env.device)
-        env.grid_x_num = torch.ceil(wp_size_x_t / GRID_SIZE).long().item()
-        env.grid_y_num = torch.ceil(wp_size_y_t / GRID_SIZE).long().item()
+    device = env.device
+    num_envs = env.num_envs
     
-    grid_x_num = env.grid_x_num
-    grid_y_num = env.grid_y_num
+    # ------------------------------------------------------------------
+    # 1. 현재 로봇 상태 가져오기
+    # ------------------------------------------------------------------
+    # get_ee_pose는 [x, y, z, roll, pitch, yaw] 형태라고 가정
+    ee_pose = get_ee_pose(env, asset_name="robot") 
+    current_pos = ee_pose[:, :3]
+    current_rot = ee_pose[:, 3:] # Euler angles (Roll, Pitch, Yaw)
 
-    # env.grid_mask가 정의되지 않았다면 초기화
-    if not hasattr(env, "grid_mask"):
-        total_dim = grid_x_num * grid_y_num * grid_mask_history_len
-
-        return torch.zeros((env.num_envs, total_dim), device=env.device)
+    # ------------------------------------------------------------------
+    # 2. 목표(Target) 가져오기 
+    # *아직 CSV 로더가 없으므로, 임시로 'ㄹ'자 경로를 수식으로 생성합니다*
+    # 나중에 이 부분을 env.targets[env.progress_idx] 로 교체하면 됩니다.
+    # ------------------------------------------------------------------
+    dt = env.step_dt
+    t = env.episode_length_buf.float() * dt # 현재 시간
     
-    # Grid Mask가 정의된 이후의 정상적인 실행 로직
-    current_mask_float = env.grid_mask.float()
-    is_reset = (env.episode_length_buf == 0).any()
-
-    # 히스토리 버퍼 초기화 및 업데이트
-    if not hasattr(env, "_grid_mask_history") or is_reset:
-        history_shape = (env.num_envs, grid_mask_history_len) + current_mask_float.shape[1:]
-        if is_reset and hasattr(env, "_grid_mask_history"):
-            # 에피소드 리셋 시 0으로 초기화
-            env._grid_mask_history = torch.zeros(history_shape, dtype=torch.float, device=env.device)
-        else:
-            # 환경 시작 시 초기화
-            env._grid_mask_history = torch.stack([current_mask_float] * grid_mask_history_len, dim=1)
-        
-    # 새로운 Grid Mask 상태를 히스토리 큐에 추가 (FIFO)
-    new_mask_float_unsqueeze = current_mask_float.unsqueeze(1)
+    # 임시 'ㄹ'자 경로 생성 (가로 0.5m, 세로 0.5m 영역)
+    # X축: 좌우로 왕복 (Sine wave)
+    # Y축: 앞으로 천천히 전진
+    # Z축: 바닥 표면(0.05m) 유지
+    #freq = 1.5 
+    #target_x = 0.5 + 0.2 * torch.sin(freq * t) 
+    #target_y = -0.3 + 0.05 * t
+    #target_z = torch.full((num_envs,), 0.05, device=device) # 높이는 5cm로 고정
     
-    # 히스토리 업데이트: 가장 오래된 데이터 제거, 최신 데이터 추가
-    env._grid_mask_history = torch.cat(
-        [env._grid_mask_history[:, 1:], new_mask_float_unsqueeze], dim=1
-    )
-
-    # 관찰 벡터 형태로 평탄화 (Flatten)
-    # shape: (num_envs, history_len * grid_x_num * grid_y_num)
-    obs_vector = env._grid_mask_history.flatten(start_dim=1)
+    #target_pos = torch.stack([target_x, target_y, target_z], dim=-1)
     
-    return obs_vector
+    # CSV 파일 기반 목표 가져오기
+    target_pos = pm.get_target_pose_from_path(env)
+    
+    # 목표 자세: 항상 바닥을 수직으로 바라보기 (Roll=180도 or 0도, Pitch=0)
+    # UR 로봇 기준, Tool이 아래를 보려면 보통 Rx=pi, Ry=0, Rz=0 등이 됨.
+    # 여기서는 오차 계산을 위해 0으로 가정 (또는 env.default_rot 사용)
+    target_rot = torch.zeros_like(current_rot) 
 
+
+    # ------------------------------------------------------------------
+    # 3. 오차(Error) 계산 (AI가 줄여야 할 값들)
+    # ------------------------------------------------------------------
+    pos_error = target_pos - current_pos
+    rot_error = target_rot - current_rot # 단순 차이 (쿼터니언 사용 권장하지만 일단 오일러로)
+
+    # ------------------------------------------------------------------
+    # 4. 힘(Force) 센서 데이터 (중요!)
+    # ------------------------------------------------------------------
+    # Isaac Lab은 보통 env.contact_forces에 센서값이 들어옴
+    if hasattr(env, "contact_forces"):
+        # Z축 힘 (누르는 힘)만 추출. 
+        # (센서 좌표계에 따라 Z가 아닐 수도 있으니 확인 필요, 보통 World Z)
+        force_z = env.contact_forces[:, 2].unsqueeze(1)
+        # 너무 튀는 값 방지 (Clamping)
+        force_z = torch.clamp(force_z, -50.0, 50.0)
+    else:
+        # 센서가 없으면 0으로 채움
+        force_z = torch.zeros((num_envs, 1), device=device)
+
+    # ------------------------------------------------------------------
+    # 5. 관측 벡터 합치기
+    # ------------------------------------------------------------------
+    # AI에게 주는 정보: [위치오차(3), 자세오차(3), 현재힘(1), 현재위치(3)]
+    # 현재 위치를 주는 이유는 '내가 작업 공간 어디쯤 있는지' 알게 하기 위함
+    obs = torch.cat([pos_error, rot_error, force_z, current_pos], dim=-1)
+    
+    return obs
 
 
 def ee_pose_history(env, history_len: int = 5) -> torch.Tensor:
     """
-    엔드이펙터 위치 및 자세(roll, pitch, yaw) 히스토리 반환
+    (기존 코드 유지) 움직임의 추세(Velocity/Acceleration)를 파악하기 위해 과거 기록을 봅니다.
     """
     global EE_HISTORY_BUFFER, EE_HISTORY_LEN
 
-    # ee_pose: (num_envs, 6) [x, y, z, roll, pitch, yaw]
-    ee_pose = get_ee_pose(env, asset_name="robot") # (num_envs, 6)
+    ee_pose = get_ee_pose(env, asset_name="robot") 
 
-    # 초기화
     if EE_HISTORY_BUFFER is None or EE_HISTORY_LEN != history_len:
         num_envs = ee_pose.shape[0]
         EE_HISTORY_BUFFER = torch.zeros((num_envs, history_len, 6), device=ee_pose.device, dtype=ee_pose.dtype)
         EE_HISTORY_LEN = history_len
 
-    # 버퍼 shift (과거→앞으로 이동)
     EE_HISTORY_BUFFER = torch.roll(EE_HISTORY_BUFFER, shifts=-1, dims=1)
-    EE_HISTORY_BUFFER[:, -1, :] = ee_pose  # 최신 값 업데이트
+    EE_HISTORY_BUFFER[:, -1, :] = ee_pose 
 
-    # flatten해서 반환
     return EE_HISTORY_BUFFER.reshape(env.num_envs, history_len * 6)
-
-
-# def get_contact_forces(env, sensor_name="contact_forces"):
-#     """Mean contact wrench [Fx, Fy, Fz, 0, 0, 0]"""
-#     sensor = env.scene.sensors[sensor_name]
-#     forces_w = sensor.data.net_forces_w
-#     mean_force = torch.mean(forces_w, dim=1)
-#     zeros_torque = torch.zeros_like(mean_force)
-#     contact_wrench = torch.cat([mean_force, zeros_torque], dim=-1)
-
-#     step = int(env.common_step_counter)
-#     if step % 100 == 0:
-#         fx, fy, fz = mean_force[0].tolist()
-#         print(f"[ContactSensor DEBUG] Step {step}: Fx={fx:.3f}, Fy={fy:.3f}, Fz={fz:.3f}")
-
-#     return contact_wrench

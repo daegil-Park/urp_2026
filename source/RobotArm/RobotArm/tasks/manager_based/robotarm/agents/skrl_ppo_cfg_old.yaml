@@ -5,7 +5,7 @@ seed: 42
 # https://skrl.readthedocs.io/en/latest/api/utils/model_instantiators.html
 models:
   separate: False
-  policy:  # [뇌 크기 키우기]
+  policy:  # see gaussian_model parameters
     class: GaussianMixin
     clip_actions: False
     clip_log_std: True
@@ -15,18 +15,16 @@ models:
     network:
       - name: net
         input: STATES
-        # [수정] 32 -> 256, 128, 64 (더 깊고 넓은 신경망 필요)
-        layers: [256, 128, 64]
+        layers: [32, 32]
         activations: elu
     output: ACTIONS
-  value:
+  value:  # see deterministic_model parameters
     class: DeterministicMixin
     clip_actions: False
     network:
       - name: net
         input: STATES
-        # [수정] Value Network도 동일하게 키움
-        layers: [256, 128, 64]
+        layers: [32, 32]
         activations: elu
     output: ONE
 
@@ -42,14 +40,12 @@ memory:
 # https://skrl.readthedocs.io/en/latest/api/agents/ppo.html
 agent:
   class: PPO
-  # [수정] 호흡 길게 가져가기
-  # 기존 32는 약 0.5초도 안 됨. 경로를 따라가려면 최소 몇 초는 봐야 함.
-  rollouts: 128  # (또는 256) 한 번에 수집하는 경험의 길이
+  rollouts: 32
   learning_epochs: 8
-  mini_batches: 4  # (rollouts / 32 정도 비율로 맞춤)
+  mini_batches: 8
   discount_factor: 0.99
   lambda: 0.95
-  learning_rate: 3.0e-04 # 정밀 제어를 위해 학습률 살짝 낮춤
+  learning_rate: 5.0e-04
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
     kl_threshold: 0.008
@@ -64,7 +60,7 @@ agent:
   value_clip: 0.2
   clip_predicted_values: True
   entropy_loss_scale: 0.0
-  value_loss_scale: 1.0 # (기존 2.0에서 조금 줄임)
+  value_loss_scale: 2.0
   kl_threshold: 0.0
   rewards_shaper_scale: 0.1
   time_limit_bootstrap: False
@@ -80,5 +76,5 @@ agent:
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:
   class: SequentialTrainer
-  timesteps: 6000  #학습 시행 횟수
+  timesteps: 6000
   environment_info: log
