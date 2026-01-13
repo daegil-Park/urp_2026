@@ -3,6 +3,7 @@
 import math
 import copy
 
+from isaaclab.actuators import ImplicitActuatorCfg
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
@@ -87,6 +88,30 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
 
     # [수정] 위에서 만든 TEMP_ROBOT_CFG를 사용합니다.
     robot: ArticulationCfg = TEMP_ROBOT_CFG.replace(prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot")
+    # 1. 초기 자세 수정 (엔드이펙터가 표적 근처에 오도록 설정)
+        # 이렇게 하면 시작하자마자 로봇이 튀어나가는 현상이 사라집니다.
+        init_state=ArticulationCfg.InitialStateCfg(
+            pos=(0.0, 0.0, 0.0),
+            joint_pos={
+                "shoulder_pan_joint": 0.0,
+                "shoulder_lift_joint": -2.0,  # 팔을 앞으로 내림
+                "elbow_joint": 2.0,           # 팔꿈치를 굽힘
+                "wrist_1_joint": -1.57,       # 손목 수평 맞춤
+                "wrist_2_joint": -1.57,
+                "wrist_3_joint": 0.0,
+            },
+        )
+    # 2. 관절 강성(Stiffness) 조절 (떨림 방지 핵심!)
+        # 기존 로봇 설정이 너무 딱딱해서(Stiffness 높음) 덜덜 떨리는 것입니다.
+        # 값을 부드럽게(100.0) 낮추고, 저항(Damping 40.0)을 줘서 진동을 잡습니다.
+        actuators={
+            "arm": ImplicitActuatorCfg(
+                joint_names_expr=[".*"], # 모든 관절에 적용
+                stiffness=100.0,         # 강성 (높으면 떨림, 낮으면 처짐)
+                damping=40.0,            # 감쇠 (진동 흡수)
+            ),
+        }
+    )
 
     # [NEW] 접촉 센서 추가 (로봇의 모든 링크 감지)
     contact_forces = ContactSensorCfg(
