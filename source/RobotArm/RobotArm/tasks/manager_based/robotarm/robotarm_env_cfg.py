@@ -166,9 +166,9 @@ class EventCfg:
             "velocity_range": (0.0, 0.0),
         },
     )
-
-    reset_grid_mask = EventTerm(
-        func=local_rew.reset_grid_mask,
+    
+    reset_scene = EventTerm(
+        func=mdp.reset_scene_to_default, 
         mode="reset",
     )
 
