@@ -72,6 +72,14 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
     # robot
     robot: ArticulationCfg = UR10E_W_SPINDLE_CFG.replace(prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot")
 
+    # [NEW] 접촉 센서 추가 (로봇의 모든 링크 감지)
+    # 로봇의 prim_path 뒤에 /.* 를 붙여서 로봇의 모든 부위 충돌을 감지합니다.
+    contact_forces = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot/.*",
+        history_length=3,
+        track_air_time=False,
+    )
+
     # lights
     dome_light = AssetBaseCfg(
         prim_path="/World/Light",
