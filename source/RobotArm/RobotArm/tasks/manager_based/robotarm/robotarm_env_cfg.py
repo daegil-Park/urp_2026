@@ -176,15 +176,18 @@ class EventCfg:
 @configclass
 class TerminationsCfg:
     """Termination terms for the MDP."""
-    # [기존 유지] 시간이 다 되면 종료
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
     
-    # 충돌/안전 장치
-    illegal_contact = DoneTerm(func=mdp.illegal_contact, params={"threshold": 100.0})
+    # [FIXED] 충돌 감지 설정 수정
+    # threshold와 함께 sensor_cfg를 반드시 넣어줘야 함
+    illegal_contact = DoneTerm(
+        func=mdp.illegal_contact, 
+        params={
+            "threshold": 100.0,
+            "sensor_cfg": SceneEntityCfg("contact_forces") # SceneCfg에 정의한 이름과 일치해야 함
+        }
+    )
 
-    # 사용자 강제 종료 (Manual Reset)
-    # 키보드 'K'를 누르면 리셋됨
-    # 로봇이 경로를 이탈하거나 이상하게 꼬이면 K
     user_reset = DoneTerm(func=local_rew.manual_termination)
 
 ##
