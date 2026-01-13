@@ -47,10 +47,11 @@ from RobotArm.robots.ur10e_w_spindle import *
 ##
 # Scene configuration
 ##
+# [수정] copy() 대신 copy.deepcopy()를 사용해야 안전합니다.
+# 얕은 복사(.copy())를 하면 내부의 spawn 객체가 원본과 공유되어 수정이 안 먹힐 수 있습니다.
+TEMP_ROBOT_CFG = copy.deepcopy(UR10E_W_SPINDLE_CFG)
 
-# [수정] 로봇 설정 복사 및 센서 활성화 (작성하신 대로 유지하되 명시적으로)
-TEMP_ROBOT_CFG = UR10E_W_SPINDLE_CFG.copy()
-# 이 부분이 이전 에러(Contact Sensor)를 고치는 핵심입니다.
+# 이제 이 설정이 확실하게 적용됩니다.
 TEMP_ROBOT_CFG.spawn.activate_contact_sensors = True
 
 @configclass
