@@ -132,8 +132,8 @@ def out_of_bounds_penalty(env: "ManagerBasedRLEnv"):
     ee_x = ee_pos[:, 0]
     ee_y = ee_pos[:, 1]
 
-    wp_size_x = env.wp_size_x
-    wp_size_y = env.wp_size_y
+    wp_size_x = env.cfg.wp_size_x
+    wp_size_y = env.cfg.wp_size_y
 
     half_x = wp_size_x / 2
     half_y = wp_size_y / 2
