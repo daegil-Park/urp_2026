@@ -192,6 +192,48 @@ class TerminationsCfg:
 ##
 
 @configclass
+class CurriculumCfg:
+    """Curriculum terms for the MDP."""
+
+    # coverage_curriculum = CurrTerm(
+    #     func=mdp.modify_reward_weight,
+    #     params={
+    #         "term_name": "coverage",
+    #         "weight": -0.0004,
+    #         "num_steps": 10000}
+    # )
+
+    # out_of_bounds_curriculum = CurrTerm(
+    #     func=mdp.modify_reward_weight,
+    #     params={
+    #         "term_name": "out_of_bounds_penalty",
+    #         "weight": 0.0002,
+    #         "num_steps": 5000}
+    # )
+
+    # ee_orientation_curriculum = CurrTerm(
+    #     func=mdp.modify_reward_weight,
+    #     params={
+    #         "term_name": "ee_orientation_alignment",
+    #         "weight": 0.0003,
+    #         "num_steps":7000}
+    # )
+
+    # time_efficiency_curriculum = CurrTerm(
+    #     func=mdp.modify_reward_weight,
+    #     params={
+    #         "term_name": "time_efficiency",
+    #         "weight": 0.0001,
+    #         "num_steps": 10000}
+    # )
+
+
+
+##
+# Environment configuration
+##
+
+@configclass
 class RobotarmEnvCfg(ManagerBasedRLEnvCfg):
     """Configuration for the polishing robot arm environment."""
 
