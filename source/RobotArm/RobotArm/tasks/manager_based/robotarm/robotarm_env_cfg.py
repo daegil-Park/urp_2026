@@ -153,6 +153,25 @@ class RewardsCfg:
     # [Optional] 작업 영역 이탈 시 큰 벌점 (안전장치)
     out_of_bounds = RewTerm(func=mdp.out_of_bounds_penalty, weight=-5.0)
 
+@configclass
+class EventCfg:
+    """Configuration for events."""
+
+    # reset
+    reset_robot_joints = EventTerm(
+        func=mdp.reset_joints_by_offset,
+        mode="reset",
+        params={
+            "position_range": (0, 0),
+            "velocity_range": (0.0, 0.0),
+        },
+    )
+
+    reset_grid_mask = EventTerm(
+        func=local_rew.reset_grid_mask,
+        mode="reset",
+    )
+
 
 @configclass
 class TerminationsCfg:
