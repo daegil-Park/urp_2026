@@ -44,10 +44,14 @@ import RobotArm.tasks.manager_based.robotarm.mdp as mdp # 기본 mdp도 필요�
 
 
 from RobotArm.robots.ur10e_w_spindle import *
-
 ##
 # Scene configuration
 ##
+
+# [수정] 클래스 안에서 만들면 에러가 나므로, 밖에서 설정을 복사하고 수정합니다.
+# 이렇게 하면 Isaac Lab이 이 변수를 검사하지 않습니다.
+TEMP_ROBOT_CFG = UR10E_W_SPINDLE_CFG.copy()
+TEMP_ROBOT_CFG.spawn.activate_contact_sensors = True
 
 @configclass
 class RobotarmSceneCfg(InteractiveSceneCfg):
@@ -71,17 +75,10 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    # robot
-    # robot: ArticulationCfg = UR10E_W_SPINDLE_CFG.replace(prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot")
-    
-    # [수정] 로봇 설정을 복사해와서 센서 옵션을 강제로 켭니다.
-    _robot_cfg = UR10E_W_SPINDLE_CFG.copy()
-    _robot_cfg.spawn.activate_contact_sensors = True 
-    
-    robot: ArticulationCfg = _robot_cfg.replace(prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot")
+    # [수정] 위에서 만든 TEMP_ROBOT_CFG를 사용합니다.
+    robot: ArticulationCfg = TEMP_ROBOT_CFG.replace(prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot")
 
     # [NEW] 접촉 센서 추가 (로봇의 모든 링크 감지)
-    # 로봇의 prim_path 뒤에 /.* 를 붙여서 로봇의 모든 부위 충돌을 감지합니다.
     contact_forces = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot/.*",
         history_length=3,
@@ -93,8 +90,6 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
         prim_path="/World/Light",
         spawn=sim_utils.DomeLightCfg(color=(0.9, 0.9, 0.9), intensity=500.0),
     )
-
-
 ##
 # MDP settings
 ##
