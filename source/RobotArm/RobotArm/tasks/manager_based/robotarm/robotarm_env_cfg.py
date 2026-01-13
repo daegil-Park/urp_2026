@@ -89,11 +89,13 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
 
     # [NEW] 접촉 센서 추가 (로봇의 모든 링크 감지)
     contact_forces = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot/.*",
+        # 기존: "{ENV_REGEX_NS}/ur10e_w_spindle_robot/.*"
+        # 수정: 중간에 /Robot/ 을 포함하거나, 구체적인 링크를 지정
+        prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot/Robot/.*", 
         history_length=3,
         track_air_time=False,
     )
-
+    
     # lights
     dome_light = AssetBaseCfg(
         prim_path="/World/Light",
