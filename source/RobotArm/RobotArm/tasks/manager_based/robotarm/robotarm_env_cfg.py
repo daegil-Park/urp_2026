@@ -212,7 +212,7 @@ class TerminationsCfg:
         }
     )
 
-    user_reset = DoneTerm(func=local_rew.manual_termination)
+  #  user_reset = DoneTerm(func=local_rew.manual_termination)
 
 ##
 # Environment configuration
