@@ -48,9 +48,9 @@ from RobotArm.robots.ur10e_w_spindle import *
 # Scene configuration
 ##
 
-# [수정] 클래스 안에서 만들면 에러가 나므로, 밖에서 설정을 복사하고 수정합니다.
-# 이렇게 하면 Isaac Lab이 이 변수를 검사하지 않습니다.
+# [수정] 로봇 설정 복사 및 센서 활성화 (작성하신 대로 유지하되 명시적으로)
 TEMP_ROBOT_CFG = UR10E_W_SPINDLE_CFG.copy()
+# 이 부분이 이전 에러(Contact Sensor)를 고치는 핵심입니다.
 TEMP_ROBOT_CFG.spawn.activate_contact_sensors = True
 
 @configclass
