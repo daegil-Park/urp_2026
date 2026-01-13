@@ -19,6 +19,8 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab.sensors import ContactSensorCfg
 
+import isaaclab.envs.mdp as mdp
+
 from . import mdp
 
 
