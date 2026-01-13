@@ -72,7 +72,13 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
     )
 
     # robot
-    robot: ArticulationCfg = UR10E_W_SPINDLE_CFG.replace(prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot")
+    # robot: ArticulationCfg = UR10E_W_SPINDLE_CFG.replace(prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot")
+    
+    # [수정] 로봇 설정을 복사해와서 센서 옵션을 강제로 켭니다.
+    _robot_cfg = UR10E_W_SPINDLE_CFG.copy()
+    _robot_cfg.spawn.activate_contact_sensors = True 
+    
+    robot: ArticulationCfg = _robot_cfg.replace(prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot")
 
     # [NEW] 접촉 센서 추가 (로봇의 모든 링크 감지)
     # 로봇의 prim_path 뒤에 /.* 를 붙여서 로봇의 모든 부위 충돌을 감지합니다.
