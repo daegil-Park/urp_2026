@@ -105,7 +105,7 @@ class ActionsCfg:
             "wrist_3_joint",
         ],
         #use_default=True,
-        scale=0.5,
+        scale=0.05, #스케일만 줄여도 로봇이 발작하는 현상은 대부분 사라집니다.
     )
     gripper_action: ActionTerm | None = None
 
