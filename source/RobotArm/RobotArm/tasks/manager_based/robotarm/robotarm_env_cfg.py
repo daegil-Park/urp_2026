@@ -289,3 +289,5 @@ class RobotarmEnvCfg(ManagerBasedRLEnvCfg):
         # simulation settings
         self.sim.dt = 1.0 / 60.0
         self.sim.render_interval = self.decimation
+        
+        self.wp_size_x = 0.5
