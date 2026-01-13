@@ -48,12 +48,19 @@ from RobotArm.robots.ur10e_w_spindle import *
 ##
 # Scene configuration
 ##
-# [수정] copy() 대신 copy.deepcopy()를 사용해야 안전합니다.
-# 얕은 복사(.copy())를 하면 내부의 spawn 객체가 원본과 공유되어 수정이 안 먹힐 수 있습니다.
+# [수정 코드] - spawn 설정을 완전히 새로 만듭니다.
 TEMP_ROBOT_CFG = copy.deepcopy(UR10E_W_SPINDLE_CFG)
 
-# 이제 이 설정이 확실하게 적용됩니다.
-TEMP_ROBOT_CFG.spawn.activate_contact_sensors = True
+# 기존 USD 경로 가져오기 (만약 에러나면 직접 경로 문자열을 넣으세요)
+original_usd_path = UR10E_W_SPINDLE_CFG.spawn.usd_path 
+
+# spawn 객체를 새로 생성하여 강제 할당
+TEMP_ROBOT_CFG.spawn = sim_utils.UsdFileCfg(
+    usd_path=original_usd_path,
+    activate_contact_sensors=True,  # 여기서 확실하게 켭니다
+    rigid_props=UR10E_W_SPINDLE_CFG.spawn.rigid_props,
+    articulation_props=UR10E_W_SPINDLE_CFG.spawn.articulation_props,
+)
 
 @configclass
 class RobotarmSceneCfg(InteractiveSceneCfg):
