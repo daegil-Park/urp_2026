@@ -19,6 +19,7 @@ from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab.sensors import ContactSensorCfg
+from isaaclab.envs import ViewerCfg
 
 import isaaclab.envs.mdp as mdp
 
@@ -147,13 +148,16 @@ class ObservationsCfg:
         # [NEW] 2. 로봇 관절 상태 (기본) - 내가 어떤 자세인지 알아야 함
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel = ObsTerm(func=mdp.joint_vel_rel)
-        
+        # 목표 위치 (필요하다면)
+        target_pos = ObsTerm(func=mdp.generated_commands, params={"command_name": "arm_action"})
         # [NEW] 3. 엔드이펙터 히스토리 (속도감, 추세 파악용)
         ee_history = ObsTerm(func=local_obs.ee_pose_history)
 
         def __post_init__(self):
             self.enable_corruption = False
             self.concatenate_terms = True
+            
+    policy: PolicyCfg = PolicyCfg()
 
 
 @configclass
