@@ -116,6 +116,54 @@ def track_path_reward(env: ManagerBasedRLEnv):
     # scale 파라미터(10.0)가 클수록 정밀한 추종을 요구함
     return torch.exp(-distance * 10.0)
 
+def out_of_bounds_penalty(env: "ManagerBasedRLEnv"):
+    """
+    작업물 XY 범위를 벗어난 경우 강한 패널티를 부여하는 보상 함수.
+    scale: penalty strength (기본=5.0)
+    """
+    robot = env.scene["robot"]
+    workpiece = env.scene["workpiece"]
+
+    base_pos_w = robot.data.root_pos_w  # 로봇 베이스의 월드 위치 (Num_Envs, 3)
+    WORKPIECE_REL_POS = torch.tensor([0.75, 0.0, 0.0], dtype=base_pos_w.dtype, device=env.device)
+    wp_pos = base_pos_w + WORKPIECE_REL_POS.unsqueeze(0)
+    
+    ee_pos = get_ee_pose(env, asset_name="robot")[:, :3]
+    ee_x = ee_pos[:, 0]
+    ee_y = ee_pos[:, 1]
+
+    wp_size_x = env.wp_size_x
+    wp_size_y = env.wp_size_y
+
+    half_x = wp_size_x / 2
+    half_y = wp_size_y / 2
+
+    # 유효 범위
+    min_x = wp_pos[:, 0] - half_x
+    max_x = wp_pos[:, 0] + half_x
+    min_y = wp_pos[:, 1] - half_y
+    max_y = wp_pos[:, 1] + half_y
+
+    # 범위 검사
+    out_x = (ee_x < min_x) | (ee_x > max_x)
+    out_y = (ee_y < min_y) | (ee_y > max_y)
+    out_of_bounds = (out_x | out_y).float()
+
+    # --- 누적 카운터 ---
+    if not hasattr(env, "_out_of_bounds_count"):
+        env._out_of_bounds_count = torch.zeros(env.num_envs, dtype=torch.float32, device=env.device)
+
+    env._out_of_bounds_count += out_of_bounds
+    # 에피소드 리셋 시 카운터 초기화
+    env._out_of_bounds_count[env.episode_length_buf == 0] = 0.0
+    # 누적 횟수에 따른 패널티 계산 (ex: 선형, 혹은 지수적 증가)
+    count_based_penalty = env._out_of_bounds_count * 0.1  # 매번 이탈 시 패널티 0.5씩 증가
+
+    # 실제 패널티 (이탈이 발생한 경우에만 적용)
+    final_penalty = -out_of_bounds * count_based_penalty
+
+    return final_penalty
+
 
 def force_control_reward(env: ManagerBasedRLEnv):
     """
