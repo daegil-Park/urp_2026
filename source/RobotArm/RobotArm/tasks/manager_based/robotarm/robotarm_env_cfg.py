@@ -1,7 +1,6 @@
 # Copyright (c) 2022-2025, The Isaac Lab Project Developers
 # SPDX-License-Identifier: BSD-3-Clause
 import math
-import importlib
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
@@ -34,8 +33,11 @@ from isaaclab.sim import UsdFileCfg
 
 # 만약 파일을 scripts 폴더 등에 따로 뒀다면 import 경로가 달라질 수 있습니다.
 # 일단 기존 구조를 따른다는 가정하에 작성합니다.
-local_obs = importlib.import_module("RobotArm.tasks.manager_based.robotarm.mdp.observation")
+# reward, observation modul import
+import importlib
+local_obs = importlib.import_module("RobotArm.tasks.manager_based.robotarm.mdp.observations")
 local_rew = importlib.import_module("RobotArm.tasks.manager_based.robotarm.mdp.rewards")
+
 import RobotArm.tasks.manager_based.robotarm.mdp as mdp # 기본 mdp도 필요할 수 있음 (종료 조건 등)
 
 
