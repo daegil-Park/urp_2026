@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import torch
+import math
 import os
 import csv
 from typing import TYPE_CHECKING
 from isaaclab.assets import RigidObject
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import matrix_from_euler, quat_apply, quat_mul, quat_from_euler_xyz, euler_xyz_from_quat, combine_frame_transforms, quat_error_magnitude
+from isaaclab.envs import ManagerBasedRLEnv
+import carb.input # 키보드 입력용
 from pxr import UsdGeom
 
 if TYPE_CHECKING:
@@ -21,6 +24,9 @@ import RobotArm.tasks.manager_based.robotarm.mdp.path_manager as pm #
 
 from RobotArm.robots.ur10e_w_spindle import *
 
+# [중요] observations.py에서 정의한 경로 데이터를 가져옵니다.
+# 이렇게 해야 한 곳만 수정하면 둘 다 바뀝니다.
+from .observations import PATH_DATA
 
 # --- [Target 생성 헬퍼 함수] ---
 # observation_1.py와 완전히 동일한 로직을 써야, 로봇이 보는 목표와 채점 기준이 일치합니다.
@@ -42,200 +48,152 @@ def _get_generated_target(env):
     return pm.get_target_pose_from_path(env)
 
 
-def get_ee_pose(env: "ManagerBasedRLEnv", asset_name: str = "robot", ee_frame_name=EE_FRAME_NAME):
+# --- [Helper Functions] ---
+
+def get_ee_pose(env: ManagerBasedRLEnv, asset_name: str = "robot"):
     """
-    Returns end-effector pose (x, y, z, roll, pitch, yaw)
-    -----------------------------------------------------
-    - 현재 로봇의 joint 상태(q1~q6)를 불러와서
-      FKSolver를 이용해 FK 계산 수행
-    - FK 결과는 torch.Tensor (num_envs, 6) 형태로 반환
+    Sim에서 제공하는 정확한 물리적 위치를 반환합니다. (FK Solver 대체)
+    Returns:
+        pose (Tensor): [x, y, z, qx, qy, qz, qw] (shape: num_envs x 7)
     """
     robot = env.scene[asset_name]
-    q = robot.data.joint_pos[:, :6]  # (num_envs, 6)
-
-    # 로봇 베이스 프레임 기준 EE 위치 및 자세 계산
-    fk_solver = FKSolver(tool_z=0.239, use_degrees=False)
-    ee_pose_local_list = []
-
-    for i in range(env.num_envs):
-        q_np = q[i].cpu().numpy().astype(float)
-        ok, pose = fk_solver.compute(q_np, as_degrees=False)
-        if not ok:
-            ee_pose_local_list.append([float('nan')]*6)
-        else:
-            ee_pose_local_list.append([pose.x, pose.y, pose.z, pose.r, pose.p, pose.yaw])
-
-    ee_pose_local = torch.tensor(ee_pose_local_list, dtype=torch.float32, device=q.device)
-    ee_pos_local = ee_pose_local[:, :3]
-    ee_rpy_local = ee_pose_local[:, 3:]
-
-    ee_quat_local = quat_from_euler_xyz(ee_rpy_local[:, 0], ee_rpy_local[:, 1], ee_rpy_local[:, 2])
-
-    # 로봇 베이스 프레임 -> 월드 프레임 변환
-    base_pos_w = robot.data.root_pos_w
-    base_quat_w = robot.data.root_quat_w
+    # UR10e의 마지막 링크(-1)의 World 좌표계 위치와 회전(쿼터니언)을 가져옵니다.
+    # body_pos_w: (num_envs, num_bodies, 3)
+    # body_quat_w: (num_envs, num_bodies, 4)
+    pos = robot.data.body_pos_w[:, -1, :]
+    quat = robot.data.body_quat_w[:, -1, :]
     
-    ee_pos_world = quat_apply(base_quat_w, ee_pos_local) + base_pos_w
-    ee_quat_world = quat_mul(base_quat_w, ee_quat_local)
+    return torch.cat([pos, quat], dim=-1)
 
-    roll_w, pitch_w, yaw_w = euler_xyz_from_quat(ee_quat_world)
-    ee_rpy_world = torch.stack([roll_w, pitch_w, yaw_w], dim=1)
 
-    ee_pose_world = torch.cat([ee_pos_world, ee_rpy_world], dim=1)
-    # print(f"EE Position from FKSolver: {ee_pose_world[1].cpu().numpy()}")
+# --- [Reward Functions] ---
+
+def track_path_reward(env: ManagerBasedRLEnv, sigma: float = 0.1):
+    """
+    [경로 추종] 현재 위치가 경로상의 가장 가까운 점과 얼마나 가까운지 평가
+    """
+    # 전역 변수 PATH_DATA 사용 (observations에서 가져옴)
+    # 디바이스 동기화
+    path_tensor = PATH_DATA
+    if path_tensor.device != env.device:
+        path_tensor = path_tensor.to(env.device)
+
+    # 1. 현재 로봇 손끝 위치
+    ee_pose = get_ee_pose(env)
+    current_pos = ee_pose[:, :3] # (num_envs, 3)
+
+    # 2. 경로상의 점들과의 거리 계산 (Broadcasting)
+    # (num_envs, 1, 3) - (1, num_points, 3) -> (num_envs, num_points, 3)
+    dists = torch.norm(current_pos.unsqueeze(1) - path_tensor.unsqueeze(0), dim=2)
     
-    ee_index_lab = env.scene["robot"].body_names.index(ee_frame_name)
-    ee_pos = env.scene["robot"].data.body_pos_w[:, ee_index_lab]
-    ee_quat = robot.data.body_quat_w[:, ee_index_lab]
-    roll, pitch, yaw = euler_xyz_from_quat(ee_quat)
-    ee_rpy = torch.stack([roll, pitch, yaw], dim=1)
+    # 3. 가장 가까운 거리(Minimum Distance) 추출
+    min_dist, _ = torch.min(dists, dim=1)
 
-    ee_pose = torch.cat([ee_pos, ee_rpy], dim=1)
+    # 4. 가우시안 커널 보상 (거리가 0이면 1.0, 멀어질수록 0.0)
+    # log를 씌우지 않은 exp 형태라 0~1 사이 값 반환
+    return torch.exp(-torch.square(min_dist) / (sigma ** 2))
 
-    return ee_pose
-
-
-# --- [핵심 보상 함수들] ---
-
-def track_path_reward(env: ManagerBasedRLEnv):
+def force_control_reward(env: ManagerBasedRLEnv, target_force: float = 10.0):
     """
-    [경로 추종] 목표 위치(Target)와 현재 위치(EE)가 가까울수록 높은 보상
+    [힘 제어] Z축 접촉 힘을 목표값(10N)에 유지하면 보상
     """
-    # 1. 목표 위치 가져오기
-    target_pos = _get_generated_target(env)
-    
-    # 2. 현재 로봇 끝단 위치 가져오기 (x, y, z)
-    # Isaac Lab 표준: quat(4)가 뒤에 붙거나 앞에 붙음. 보통 state_w는 [pos(3), quat(4)]
-    ee_state = get_ee_pose(env)
-    current_pos = ee_state[:, :3]
-
-    # 3. 거리 계산 (L2 Norm)
-    distance = torch.norm(target_pos - current_pos, dim=-1)
-    
-    # 4. 점수 변환 (거리가 0이면 1점, 멀어지면 0점으로 수렴)
-    # scale 파라미터(10.0)가 클수록 정밀한 추종을 요구함
-    return torch.exp(-distance * 10.0)
-
-def out_of_bounds_penalty(env: "ManagerBasedRLEnv"):
-    """
-    작업물 XY 범위를 벗어난 경우 강한 패널티를 부여하는 보상 함수.
-    scale: penalty strength (기본=5.0)
-    """
-    robot = env.scene["robot"]
-    workpiece = env.scene["workpiece"]
-
-    base_pos_w = robot.data.root_pos_w  # 로봇 베이스의 월드 위치 (Num_Envs, 3)
-    WORKPIECE_REL_POS = torch.tensor([0.75, 0.0, 0.0], dtype=base_pos_w.dtype, device=env.device)
-    wp_pos = base_pos_w + WORKPIECE_REL_POS.unsqueeze(0)
-    
-    ee_pos = get_ee_pose(env, asset_name="robot")[:, :3]
-    ee_x = ee_pos[:, 0]
-    ee_y = ee_pos[:, 1]
-
-    wp_size_x = env.cfg.wp_size_x
-    wp_size_y = env.cfg.wp_size_y
-
-    half_x = wp_size_x / 2
-    half_y = wp_size_y / 2
-
-    # 유효 범위
-    min_x = wp_pos[:, 0] - half_x
-    max_x = wp_pos[:, 0] + half_x
-    min_y = wp_pos[:, 1] - half_y
-    max_y = wp_pos[:, 1] + half_y
-
-    # 범위 검사
-    out_x = (ee_x < min_x) | (ee_x > max_x)
-    out_y = (ee_y < min_y) | (ee_y > max_y)
-    out_of_bounds = (out_x | out_y).float()
-
-    # --- 누적 카운터 ---
-    if not hasattr(env, "_out_of_bounds_count"):
-        env._out_of_bounds_count = torch.zeros(env.num_envs, dtype=torch.float32, device=env.device)
-
-    env._out_of_bounds_count += out_of_bounds
-    # 에피소드 리셋 시 카운터 초기화
-    env._out_of_bounds_count[env.episode_length_buf == 0] = 0.0
-    # 누적 횟수에 따른 패널티 계산 (ex: 선형, 혹은 지수적 증가)
-    count_based_penalty = env._out_of_bounds_count * 0.1  # 매번 이탈 시 패널티 0.5씩 증가
-
-    # 실제 패널티 (이탈이 발생한 경우에만 적용)
-    final_penalty = -out_of_bounds * count_based_penalty
-
-    return final_penalty
-
-
-def force_control_reward(env: ManagerBasedRLEnv):
-    """
-    [힘 제어] Z축으로 누르는 힘을 목표값(10N)에 맞추면 보상
-    """
-    target_force = 10.0 # 목표: 10 Newton
-    
-    if hasattr(env, "contact_forces"):
-        # 센서 데이터에서 Z축 추출 (절대값 사용)
-        current_force = torch.abs(env.contact_forces[:, 2])
+    # 1. 센서 데이터 가져오기 (EnvCfg에 정의된 이름 확인 필수)
+    if "contact_forces" in env.scene.sensors:
+        sensor = env.scene["contact_forces"]
+        # net_forces_w: (num_envs, num_links, 3)
+        # 2번 인덱스(Z축) 힘의 크기 사용
+        # 보통 센서가 여러 링크에 걸쳐있을 수 있으니 합산하거나 특정 링크만 봐야 함
+        # 여기서는 전체 링크 중 가장 큰 힘을 받는 곳 기준 or 합산
+        # 안전하게: 마지막 차원(xyz) 중 z성분의 norm
+        force_z = torch.abs(sensor.data.net_forces_w[..., 2])
+        # 여러 링크 중 최대 힘 (보통 툴 끝)
+        current_force, _ = torch.max(force_z, dim=-1) 
     else:
-        # 센서 없으면 0점 처리 (또는 에러 방지용 0)
         current_force = torch.zeros(env.num_envs, device=env.device)
-        
+
+    # 2. 오차 계산
     force_error = torch.abs(current_force - target_force)
-    
-    # 오차가 작을수록 큰 보상 (1.0 / (1 + 오차))
-    # 오차 0N -> 1.0점, 오차 10N -> 약 0.1점
-    return 1.0 / (1.0 + 0.2 * force_error)
+
+    # 3. 보상 변환 (오차가 0일 때 1.0)
+    # 분모 1.0 더해서 0 나누기 방지
+    return 1.0 / (1.0 + 0.1 * force_error)
 
 
 def orientation_align_reward(env: ManagerBasedRLEnv):
     """
-    [자세 유지] 툴이 바닥과 수직(Z축 정렬)을 유지하는지 평가
+    [자세 유지] Tool이 바닥(World -Z 방향)을 수직으로 바라보는지 평가
     """
-    ee_state = get_ee_pose(env)
-    ee_quat = ee_state[:, 3:7] # [qx, qy, qz, qw] (순서 확인 필요)
-    
-    # 목표 자세: 바닥을 향함 (아래쪽) -> 대략적인 벡터 내적 사용
-    # 로봇 Tool의 Z축 벡터를 추출해서 (0, 0, -1)과 내적
-    # (수학적으로 복잡하면, 간단히 r, p가 0인지 보는 것으로 대체 가능)
-    
-    # 여기서는 간단하게 'action'에서 회전 명령이 적을수록 좋다고 유도하거나
-    # 현재 쿼터니언이 초기 자세와 비슷한지 비교하는 방식을 추천
-    return 0.5 # (일단 기본 점수 부여, 추후 정밀 구현)
+    ee_pose = get_ee_pose(env)
+    ee_quat = ee_pose[:, 3:] # (qx, qy, qz, qw)
 
+    # 1. 로봇 Tool의 Z축 벡터 (Local 0,0,1)
+    tool_z_local = torch.zeros_like(ee_pose[:, :3])
+    tool_z_local[:, 2] = 1.0 
+    
+    # 2. 쿼터니언 회전 적용 -> World 좌표계 벡터
+    tool_z_world = quat_apply(ee_quat, tool_z_local)
 
+    # 3. 목표 벡터 (World -Z: 0, 0, -1)
+    target_dir = torch.zeros_like(tool_z_world)
+    target_dir[:, 2] = -1.0 
+
+    # 4. 내적 (Dot Product): 방향이 같으면 1.0
+    dot_prod = torch.sum(tool_z_world * target_dir, dim=-1)
+    
+    # 5. 음수(반대방향)는 0 처리
+    reward = torch.clamp(dot_prod, min=0.0)
+    
+    return reward
+    
 def action_smoothness_penalty(env: ManagerBasedRLEnv):
     """
-    [부드러움] 로봇이 급격하게 움직이면(Jerk) 벌점(마이너스 점수)
+    [부드러움] 급격한 동작 방지 (Action 값의 크기 억제)
     """
-    # 이번 스텝의 행동(Action) 값의 크기가 클수록 감점 (에너지 최소화)
-    # 또는 이전 행동과의 차이(Delta Action)를 사용
-    if hasattr(env, "actions"):
-        # Action 제곱의 합 (L2 Norm squared)
-        return -torch.sum(torch.square(env.actions), dim=-1)
-    return 0.0
+    # Action 값의 제곱합 -> 에너지를 적게 쓸수록(0에 가까울수록) 페널티 적음
+    # 음수를 리턴하므로 페널티
+    return -torch.sum(torch.square(env.action_manager.action), dim=-1)
 
-# rewards_1.py 맨 아래에 추가
+def out_of_bounds_penalty(env: ManagerBasedRLEnv):
+    """
+    [이탈 방지] 작업 영역 벗어나면 벌점
+    """
+    # 1. 현재 위치
+    ee_pos = get_ee_pose(env)[:, :3]
+    
+    # 2. 작업 영역 정의 (cfg에서 읽거나 기본값)
+    # env.cfg가 아니라 env.unwrapped.cfg 등에 있을 수 있으므로 안전하게 getattr 사용
+    # 여기서는 하드코딩된 안전 영역 설정
+    wp_pos_x, wp_pos_y = 0.5, 0.0
+    wp_size_x, wp_size_y = 0.6, 0.6 # 조금 여유 있게
 
-import carb.input # 키보드 입력을 받기 위한 라이브러리
+    # 3. 경계 확인
+    is_out_x = (ee_pos[:, 0] < (wp_pos_x - wp_size_x)) | (ee_pos[:, 0] > (wp_pos_x + wp_size_x))
+    is_out_y = (ee_pos[:, 1] < (wp_pos_y - wp_size_y)) | (ee_pos[:, 1] > (wp_pos_y + wp_size_y))
+    is_out_z = (ee_pos[:, 2] < 0.0) | (ee_pos[:, 2] > 0.5) # 바닥 뚫거나 너무 높이 가면
+
+    is_out = (is_out_x | is_out_y | is_out_z).float()
+    
+    return -1.0 * is_out
+
+def check_coverage_success(env: ManagerBasedRLEnv):
+    """
+    (종료 조건) 임시: 경로 오차가 아주 작으면 성공으로 간주?
+    지금은 항상 False를 반환해서 시간 끝날 때까지 돌게 함
+    """
+    return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
 
 def manual_termination(env: ManagerBasedRLEnv):
     """
-    사용자가 'K' (Kill) 키를 누르면 모든 환경을 리셋(종료)시킵니다.
+    'K' 키를 누르면 강제 종료 (리셋)
     """
-    # 1. 입력 인터페이스 가져오기
-    input_i = carb.input.acquire_input_interface()
-    keyboard = input_i.get_keyboard()
-    
-    # 2. 'K' 키가 눌렸는지 확인 (눌리면 1.0 반환)
-    # (원하시는 다른 키가 있다면 carb.input.KeyboardInput.SPACE 등으로 변경 가능)
-    is_pressed = input_i.get_keyboard_value(keyboard, carb.input.KeyboardInput.K)
-    
-    # 3. 눌렸다면 모든 환경(num_envs)에 대해 True(종료) 신호 보냄
-    if is_pressed > 0.5:
-        return torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
-    else:
-        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    try:
+        input_i = carb.input.acquire_input_interface()
+        keyboard = input_i.get_keyboard()
+        if input_i.get_keyboard_value(keyboard, carb.input.KeyboardInput.K) > 0.5:
+            return torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+    except Exception:
+        pass # carb를 못 불러오거나 헤드리스 모드일 경우 무시
+        
+    return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
 
-# -----------------------------------------------
-# [삭제/무시된 함수들]
-# 기존의 new_visit_reward, revisit_penalty 등은 
-# 폴리싱 경로 추종에는 방해가 되므로 이 파일에 포함하지 않았습니다.
-# -----------------------------------------------
+
