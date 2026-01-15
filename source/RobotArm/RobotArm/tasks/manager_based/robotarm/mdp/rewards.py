@@ -108,11 +108,6 @@ def force_control_reward(env: ManagerBasedRLEnv, target_force: float = 10.0):
     # 3. 보상 변환 (오차가 0일 때 1.0) : 분모 1.0 더해서 0 나누기 방지
     return 1.0 / (1.0 + 0.1 * force_error)
 
-
-
-
-
-
 def orientation_align_reward(env: ManagerBasedRLEnv):
     """
     [자세 유지] Tool이 바닥(World -Z 방향)을 수직으로 바라보는지 평가
