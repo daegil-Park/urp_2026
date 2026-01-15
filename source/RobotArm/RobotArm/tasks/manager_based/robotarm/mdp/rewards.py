@@ -23,7 +23,6 @@ if "nrs_fk_core" not in sys.modules:
     from nrs_fk_core import FKSolver
 else:
     FKSolver = sys.modules["nrs_fk_core"].FKSolver
-import RobotArm.tasks.manager_based.robotarm.mdp.path_manager as pm # 
 
 from RobotArm.robots.ur10e_w_spindle import *
 
@@ -66,7 +65,7 @@ def track_path_reward(env: ManagerBasedRLEnv, sigma: float = 0.1):
     """
     # 전역 변수 PATH_DATA 사용 (observations에서 가져옴)
     # 디바이스 동기화
-    path_tensor = PATH_DATA
+    path_tensor = path_loader.get_path_tensor(env.device)
     if path_tensor.device != env.device:
         path_tensor = path_tensor.to(env.device)
 
