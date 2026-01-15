@@ -88,26 +88,30 @@ def force_control_reward(env: ManagerBasedRLEnv, target_force: float = 10.0):
     """
     [힘 제어] Z축 접촉 힘을 목표값(10N)에 유지하면 보상
     """
+    # 지금은 무조건 0.0을 반환해서 학습에 영향을 주지 않게 함
+    return torch.zeros(env.num_envs, device=env.device)
+    # --- 아래는 나중에 접촉 작업 할 때 주석 해제하세요 ---
     # 1. 센서 데이터 가져오기 (EnvCfg에 정의된 이름 확인 필수)
-    if "contact_forces" in env.scene.sensors:
-        sensor = env.scene["contact_forces"]
+    #if "contact_forces" in env.scene.sensors:
+     #   sensor = env.scene["contact_forces"]
         # net_forces_w: (num_envs, num_links, 3)
         # 2번 인덱스(Z축) 힘의 크기 사용
         # 보통 센서가 여러 링크에 걸쳐있을 수 있으니 합산하거나 특정 링크만 봐야 함
         # 여기서는 전체 링크 중 가장 큰 힘을 받는 곳 기준 or 합산
         # 안전하게: 마지막 차원(xyz) 중 z성분의 norm
-        force_z = torch.abs(sensor.data.net_forces_w[..., 2])
+      #  force_z = torch.abs(sensor.data.net_forces_w[..., 2])
         # 여러 링크 중 최대 힘 (보통 툴 끝)
-        current_force, _ = torch.max(force_z, dim=-1) 
-    else:
-        current_force = torch.zeros(env.num_envs, device=env.device)
+      #  current_force, _ = torch.max(force_z, dim=-1) 
+    #else:
+    #    current_force = torch.zeros(env.num_envs, device=env.device)
 
     # 2. 오차 계산
-    force_error = torch.abs(current_force - target_force)
+#    force_error = torch.abs(current_force - target_force)
 
     # 3. 보상 변환 (오차가 0일 때 1.0)
     # 분모 1.0 더해서 0 나누기 방지
-    return 1.0 / (1.0 + 0.1 * force_error)
+ #   return 1.0 / (1.0 + 0.1 * force_error)
+
 
 
 def orientation_align_reward(env: ManagerBasedRLEnv):
