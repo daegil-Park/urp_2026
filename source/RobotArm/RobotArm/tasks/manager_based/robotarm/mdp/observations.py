@@ -6,7 +6,6 @@ import torch
 import numpy as np
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
-from RobotArm.tasks.manager_based.robotarm.mdp.rewards import get_ee_pose # rewards에서 EE 위치 가져오는 함수 재사용
 import RobotArm.tasks.manager_based.robotarm.mdp.path_manager as pm # 경로 매니저 import
 
 # [1] 전역 버퍼 (속도/가속도 추정을 위한 히스토리 저장용)
