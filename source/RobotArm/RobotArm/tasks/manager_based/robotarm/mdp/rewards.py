@@ -91,7 +91,7 @@ def force_control_reward(env: ManagerBasedRLEnv, target_force: float = 10.0):
     # 1. 센서 데이터 가져오기 (EnvCfg에 정의된 이름 확인 필수)
     if "contact_forces" in env.scene.sensors:
         sensor = env.scene["contact_forces"]
-         net_forces_w: (num_envs, num_links, 3)
+        net_forces_w: (num_envs, num_links, 3)
         # 2번 인덱스(Z축) 힘의 크기 사용
         # 보통 센서가 여러 링크에 걸쳐있을 수 있으니 합산하거나 특정 링크만 봐야 함
         # 여기서는 전체 링크 중 가장 큰 힘을 받는 곳 기준 or 합산
