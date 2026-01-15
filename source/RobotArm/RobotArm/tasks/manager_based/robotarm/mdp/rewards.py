@@ -26,7 +26,22 @@ from RobotArm.robots.ur10e_w_spindle import *
 
 # [중요] observations.py에서 정의한 경로 데이터를 가져옵니다.
 # 이렇게 해야 한 곳만 수정하면 둘 다 바뀝니다.
-from .observations import PATH_DATA
+# from .observations import PATH_DATA
+
+# [수정] observations에서 Import하지 않습니다! (순환 참조 원천 차단)
+# 여기에 데이터를 똑같이 한 번 더 정의합니다.
+PATH_DATA = torch.tensor([
+    [0.4, -0.2, 0.05],
+    [0.4, -0.1, 0.05],
+    [0.4,  0.0, 0.05],
+    [0.4,  0.1, 0.05],
+    [0.4,  0.2, 0.05],
+    [0.5,  0.2, 0.05],
+    [0.5,  0.1, 0.05],
+    [0.5,  0.0, 0.05],
+    [0.5, -0.1, 0.05],
+    [0.5, -0.2, 0.05]
+], dtype=torch.float32)
 
 # --- [Target 생성 헬퍼 함수] ---
 # observation_1.py와 완전히 동일한 로직을 써야, 로봇이 보는 목표와 채점 기준이 일치합니다.
