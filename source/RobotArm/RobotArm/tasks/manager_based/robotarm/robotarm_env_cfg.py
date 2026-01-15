@@ -94,9 +94,9 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
             pos=(0.0, 0.0, 0.05), # z축으로 5cm만 띄워보세요 (기존 0.0)
             joint_pos={
                 "shoulder_pan_joint": 0.0,
-                "shoulder_lift_joint": -1.57,  # 팔을 앞으로 내림
-                "elbow_joint": 1.57,           # 팔꿈치를 굽힘
-                "wrist_1_joint": -1.57,       # 손목 수평 맞춤
+                "shoulder_lift_joint": -1.57,  # -1.57 (90도, 앞으로 나란히)
+                "elbow_joint": 1.57,           # 팔꿈치 90도 굽힘
+                "wrist_1_joint": -1.57,       # 손목 정렬
                 "wrist_2_joint": -1.57,
                 "wrist_3_joint": 0.0,
             },
