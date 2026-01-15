@@ -157,8 +157,8 @@ class ActionsCfg:
             "wrist_3_joint",
         ],
         #use_default=True,
-        #scale=0.05, #스케일만 줄여도 로봇이 발작하는 현상은 대부분 사라집니다.
-        scale=0.5, #기존에 사용하던 값
+        scale=0.02, #스케일만 줄여도 로봇이 발작하는 현상은 대부분 사라집니다.
+        #scale=0.5, #기존에 사용하던 값
     )
     gripper_action: ActionTerm | None = None
 
@@ -194,7 +194,7 @@ class RewardsCfg:
     track_path = RewTerm(func=local_rew.track_path_reward, weight=10.0)
     
     # [NEW] 2. 힘 제어 (10N 유지)
-    force_control = RewTerm(func=local_rew.force_control_reward, weight=2.0)
+    #force_control = RewTerm(func=local_rew.force_control_reward, weight=2.0)
     
     # [NEW] 3. 자세 유지 (수직 유지)
     orientation = RewTerm(func=local_rew.orientation_align_reward, weight=5.0)
