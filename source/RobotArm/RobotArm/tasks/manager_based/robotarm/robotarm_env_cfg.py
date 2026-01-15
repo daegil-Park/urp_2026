@@ -91,7 +91,7 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
         prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot",
         # 1. 초기 자세 수정 (엔드이펙터가 표적 근처에 오도록 설정)
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(0.0, 0.0, 0.05) # z축으로 5cm만 띄워보세요 (기존 0.0), 
+            pos=(0.0, 0.0, 0.05), # z축으로 5cm만 띄워보세요 (기존 0.0)
             joint_pos={
                 "shoulder_pan_joint": 0.0,
                 "shoulder_lift_joint": -1.0,  # 팔을 앞으로 내림
