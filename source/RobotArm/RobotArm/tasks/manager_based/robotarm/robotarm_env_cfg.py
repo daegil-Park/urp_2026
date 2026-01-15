@@ -107,8 +107,10 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
         actuators={
             "arm": ImplicitActuatorCfg(
                 joint_names_expr=[".*"], # 모든 관절에 적용
-                stiffness=100.0,         # 강성 (높으면 떨림, 낮으면 처짐)
-                damping=40.0,            # 감쇠 (진동 흡수)
+                #stiffness=100.0,         # 강성 (높으면 떨림, 낮으면 처짐)
+                #damping=40.0,            # 감쇠 (진동 흡수)
+                stiffness=400.0,  # 100은 너무 낮습니다. 400 정도로 올려서 지탱하게 하세요.
+                damping=80.0,     # 40->80으로 2배 올리세요. 진동을 싹 잡아줍니다.
             ),
         }
     )
@@ -155,7 +157,8 @@ class ActionsCfg:
             "wrist_3_joint",
         ],
         #use_default=True,
-        scale=0.05, #스케일만 줄여도 로봇이 발작하는 현상은 대부분 사라집니다.
+        #scale=0.05, #스케일만 줄여도 로봇이 발작하는 현상은 대부분 사라집니다.
+        scale=0.5, #기존에 사용하던 값
     )
     gripper_action: ActionTerm | None = None
 
