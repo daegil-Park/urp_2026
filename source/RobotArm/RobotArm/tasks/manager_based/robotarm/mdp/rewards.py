@@ -52,19 +52,12 @@ def _get_generated_target(env):
 
 def get_ee_pose(env: ManagerBasedRLEnv, asset_name: str = "robot"):
     """
-    Sim에서 제공하는 정확한 물리적 위치를 반환합니다. (FK Solver 대체)
-    Returns:
-        pose (Tensor): [x, y, z, qx, qy, qz, qw] (shape: num_envs x 7)
+    Sim에서 제공하는 정확한 물리적 위치를 반환합니다.
     """
     robot = env.scene[asset_name]
-    # UR10e의 마지막 링크(-1)의 World 좌표계 위치와 회전(쿼터니언)을 가져옵니다.
-    # body_pos_w: (num_envs, num_bodies, 3)
-    # body_quat_w: (num_envs, num_bodies, 4)
     pos = robot.data.body_pos_w[:, -1, :]
     quat = robot.data.body_quat_w[:, -1, :]
-    
     return torch.cat([pos, quat], dim=-1)
-
 
 # --- [Reward Functions] ---
 
