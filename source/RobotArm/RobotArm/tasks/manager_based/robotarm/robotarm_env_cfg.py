@@ -94,9 +94,9 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
             pos=(0.0, 0.0, 0.05), # z축으로 5cm만 띄워보세요 (기존 0.0)
             joint_pos={
                 "shoulder_pan_joint": 0.0,
-                "shoulder_lift_joint": -1.0,  # 팔을 앞으로 내림
-                "elbow_joint": 1.5,           # 팔꿈치를 굽힘
-                "wrist_1_joint": -2.0,       # 손목 수평 맞춤
+                "shoulder_lift_joint": -1.57,  # 팔을 앞으로 내림
+                "elbow_joint": 1.57,           # 팔꿈치를 굽힘
+                "wrist_1_joint": -1.57,       # 손목 수평 맞춤
                 "wrist_2_joint": -1.57,
                 "wrist_3_joint": 0.0,
             },
@@ -157,7 +157,7 @@ class ActionsCfg:
             "wrist_3_joint",
         ],
         #use_default=True,
-        scale=0.02, #스케일만 줄여도 로봇이 발작하는 현상은 대부분 사라집니다.
+        scale=0.05, #스케일만 줄여도 로봇이 발작하는 현상은 대부분 사라집니다.
         #scale=0.5, #기존에 사용하던 값
     )
     gripper_action: ActionTerm | None = None
