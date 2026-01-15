@@ -94,9 +94,9 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
             pos=(0.0, 0.0, 0.0),
             joint_pos={
                 "shoulder_pan_joint": 0.0,
-                "shoulder_lift_joint": -2.0,  # 팔을 앞으로 내림
-                "elbow_joint": 2.0,           # 팔꿈치를 굽힘
-                "wrist_1_joint": -1.57,       # 손목 수평 맞춤
+                "shoulder_lift_joint": -1.0,  # 팔을 앞으로 내림
+                "elbow_joint": 1.5,           # 팔꿈치를 굽힘
+                "wrist_1_joint": -2.0,       # 손목 수평 맞춤
                 "wrist_2_joint": -1.57,
                 "wrist_3_joint": 0.0,
             },
@@ -107,7 +107,7 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
         actuators={
             "arm": ImplicitActuatorCfg(
                 joint_names_expr=[".*"], # 모든 관절에 적용
-                stiffness=100.0,         # 강성 (높으면 떨림, 낮으면 처짐)
+                stiffness=200.0,         # 강성 (높으면 떨림, 낮으면 처짐)
                 damping=40.0,            # 감쇠 (진동 흡수)
             ),
         }
