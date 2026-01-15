@@ -91,7 +91,7 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
         prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot",
         # 1. 초기 자세 수정 (엔드이펙터가 표적 근처에 오도록 설정)
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(0.0, 0.0, 0.0),
+            pos=(0.0, 0.0, 0.05) # z축으로 5cm만 띄워보세요 (기존 0.0), 
             joint_pos={
                 "shoulder_pan_joint": 0.0,
                 "shoulder_lift_joint": -1.0,  # 팔을 앞으로 내림
@@ -107,7 +107,7 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
         actuators={
             "arm": ImplicitActuatorCfg(
                 joint_names_expr=[".*"], # 모든 관절에 적용
-                stiffness=200.0,         # 강성 (높으면 떨림, 낮으면 처짐)
+                stiffness=100.0,         # 강성 (높으면 떨림, 낮으면 처짐)
                 damping=40.0,            # 감쇠 (진동 흡수)
             ),
         }
@@ -305,14 +305,15 @@ class RobotarmEnvCfg(ManagerBasedRLEnvCfg):
 
     def __post_init__(self) -> None:
         """Post initialization."""
-        self.decimation = 2 # 시뮬레이션 2번 돌 때 제어 1번 (제어 주기 조절)
+        self.decimation = 4 # 제어 주기는 30Hz 유지 (120 / 4 = 30)
         self.episode_length_s = 15.0 # 에피소드 길이 (15초 동안 폴리싱)
         
         # 뷰어 설정 (카메라 위치)
         self.viewer.eye = [2.0, 2.0, 2.0]
         self.viewer.lookat = [0.0, 0.0, 0.0]
         # simulation settings
-        self.sim.dt = 1.0 / 60.0
+        # [수정] 물리 계산을 1초에 120번 하도록 변경 (더 부드러워짐)
+        self.sim.dt = 1.0 / 120.0 
         self.sim.render_interval = self.decimation
         
         self.wp_size_x = 0.5
