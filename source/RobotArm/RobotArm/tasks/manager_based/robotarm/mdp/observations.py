@@ -6,7 +6,6 @@ import torch
 import numpy as np
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
-import RobotArm.tasks.manager_based.robotarm.mdp.path_manager as pm # 경로 매니저 import
 
 # [중요] 방금 만든 로더 임포트 (같은 폴더에 있어야 함)
 from . import path_loader
