@@ -45,11 +45,20 @@ DEVICE_READY_STATE = {
 
 TEMP_ROBOT_CFG = copy.deepcopy(UR10E_W_SPINDLE_CFG)
 
-# 로봇 자체의 충돌 센서 활성화
+# [핵심 수정 1] 로봇 자체에 CCD(연속 충돌 감지)를 켜서 '터널링' 방지
 TEMP_ROBOT_CFG.spawn = sim_utils.UsdFileCfg(
     usd_path=UR10E_W_SPINDLE_CFG.spawn.usd_path,
-    activate_contact_sensors=True, 
-    rigid_props=UR10E_W_SPINDLE_CFG.spawn.rigid_props,
+    activate_contact_sensors=True,
+    rigid_props=sim_utils.RigidBodyPropertiesCfg(
+        disable_gravity=False,
+        retain_accelerations=False,
+        linear_damping=0.0,
+        angular_damping=0.0,
+        max_linear_velocity=1000.0,
+        max_angular_velocity=1000.0,
+        max_depenetration_velocity=1.0, # 뚫고 들어갔을 때 튕겨나오는 속도 제한
+        enable_ccd=True, # [중요] 고속 이동 시 벽 뚫기 방지
+    ),
     articulation_props=UR10E_W_SPINDLE_CFG.spawn.articulation_props,
 )
 
@@ -57,36 +66,40 @@ TEMP_ROBOT_CFG.spawn = sim_utils.UsdFileCfg(
 class RobotarmSceneCfg(InteractiveSceneCfg):
     """Configuration for the scene with a robotic arm."""
 
-    # 1. Ground (바닥)
+    # 1. Ground
     ground = AssetBaseCfg(
         prim_path="/World/ground",
         spawn=sim_utils.GroundPlaneCfg(),
         init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0)),
     )
 
-    # 2. Workpiece (물리적 실체가 있는 상자로 교체)
-    # [중요] 기존 USD 대신 CuboidCfg를 사용하여 물리 충돌을 강제합니다.
+    # 2. Workpiece (물리 재질 추가)
     workpiece = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Workpiece",
         spawn=sim_utils.CuboidCfg(
-            size=(0.5, 0.5, 0.1),  # 가로 0.5m, 세로 0.5m, 높이 0.1m
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.6, 0.6, 0.6)), # 회색
+            size=(0.5, 0.5, 0.1), 
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.3, 0.3, 0.3)), # 어두운 회색
             
-            # [물리 속성 핵심]
+            # [핵심 수정 2] 물리 재질 (Physics Material) 추가
+            # 마찰력을 높여서 로봇이 닿았을 때 미끄러지지 않고 '단단함'을 느끼게 함
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                static_friction=1.0,  # 정지 마찰
+                dynamic_friction=1.0, # 운동 마찰
+                restitution=0.0,      # 반발 계수 (0 = 튀어오르지 않음, 흡수)
+            ),
+            
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                kinematic_enabled=True, # True = 고정된 물체 (로봇이 밀어도 안 밀림)
+                kinematic_enabled=True, # 고정된 벽
                 disable_gravity=True,
             ),
-            # [충돌 속성 핵심] 이 줄이 없으면 유령입니다.
             collision_props=sim_utils.CollisionPropertiesCfg(), 
         ),
         init_state=AssetBaseCfg.InitialStateCfg(
-            # 상자의 중심 좌표. 높이 0.1m 상자이므로 Z=0.05에 두면 바닥 위에 딱 붙습니다.
-            pos=(0.75, 0.0, 0.05), 
+            pos=(0.75, 0.0, 0.05),
         ),
     )
 
-    # 3. Robot
+    # 3. Robot (제어 파라미터 튜닝)
     robot: ArticulationCfg = TEMP_ROBOT_CFG.replace(
         prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot",
         init_state=ArticulationCfg.InitialStateCfg(
@@ -96,8 +109,11 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
         actuators={
             "arm": ImplicitActuatorCfg(
                 joint_names_expr=[".*"],
-                stiffness=200.0,   # 강성을 높여서 흐물거림 방지
-                damping=40.0,     
+                # [핵심 수정 3] 강성(Stiffness)은 낮추고 댐핑(Damping)은 높임
+                # 너무 딱딱하면(Stiffness High) 충돌 시 발광함.
+                # 댐핑이 높으면 물속에 있는 것처럼 움직임이 차분해짐.
+                stiffness=100.0,   
+                damping=60.0,     
             ),
         }
     )
@@ -129,7 +145,10 @@ class ActionsCfg:
     arm_action: ActionTerm = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=[".*"],
-        scale=0.02, # 액션 스케일
+        # [핵심 수정 4] Action Scale 축소
+        # 로봇이 한 번에 너무 크게 움직이려 하면 물리 엔진이 깨짐.
+        # 0.02 -> 0.01로 줄여서 더 조심스럽게 움직이도록 함.
+        scale=0.01, 
         use_default=True, 
     )
     gripper_action: ActionTerm | None = None
@@ -159,11 +178,11 @@ class RewardsCfg:
     joint_reg = RewTerm(func=local_rew.joint_deviation_reward, weight=2.0)
     force_control = RewTerm(func=local_rew.force_control_reward, weight=1.0, params={"target_force": 10.0})
 
-    # Penalties
-    joint_vel = RewTerm(func=local_rew.joint_vel_penalty, weight=-0.01)
-    smoothness = RewTerm(func=local_rew.action_smoothness_penalty, weight=-0.01)
+    # Penalties (움직임 억제 강화)
+    # 속도와 가속도에 대한 페널티를 강화하여 휘젓기 방지
+    joint_vel = RewTerm(func=local_rew.joint_vel_penalty, weight=-0.05) 
+    smoothness = RewTerm(func=local_rew.action_smoothness_penalty, weight=-0.05)
     
-    # 영역 이탈 페널티
     out_of_bounds = RewTerm(func=local_rew.out_of_bounds_penalty, weight=-5.0)
 
 
@@ -179,9 +198,7 @@ class EventCfg:
 class TerminationsCfg:
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
     
-    # [추가] 물리적 한계선 (Safety Net)
-    # 로봇의 몸체(Root)나 관절이 바닥(Z=0) 아래로 내려가면 에피소드 종료
-    # 이는 물리 엔진이 뚫리더라도 학습 로직에서 잡아냅니다.
+    # 바닥 뚫기 방지 (Safety Net)
     underground_death = DoneTerm(
         func=mdp.root_height_below_minimum,
         params={"minimum_height": -0.02, "asset_cfg": SceneEntityCfg("robot")}
@@ -195,7 +212,7 @@ class CurriculumCfg:
 
 @configclass
 class RobotarmEnvCfg(ManagerBasedRLEnvCfg):
-    scene: RobotarmSceneCfg = RobotarmSceneCfg(num_envs=64, env_spacing=2.5) # 디버깅을 위해 개수 줄임
+    scene: RobotarmSceneCfg = RobotarmSceneCfg(num_envs=64, env_spacing=2.5)
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
     events: EventCfg = EventCfg()
@@ -207,7 +224,15 @@ class RobotarmEnvCfg(ManagerBasedRLEnvCfg):
     def __post_init__(self) -> None:
         self.decimation = 4            
         self.episode_length_s = 15.0   
+        # [핵심 수정 5] 물리 엔진 주사율(Frequency) 상향
+        # dt를 줄여서 물리 계산을 더 촘촘하게 수행 -> 터널링 방지에 결정적
         self.sim.dt = 1.0 / 120.0 
         self.sim.render_interval = self.decimation
+        
+        # [PhysX 설정 강화]
+        self.sim.physx.bounce_threshold_velocity = 0.2
+        self.sim.physx.enable_stabilization = True
+        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024
+        
         self.wp_size_x = 0.5
         self.wp_size_y = 0.5
