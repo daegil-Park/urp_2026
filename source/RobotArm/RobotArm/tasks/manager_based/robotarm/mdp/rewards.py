@@ -50,6 +50,13 @@ _force_control_history = []
 _episode_counter = 0
 
 # -----------------------------------------------------------
+# [NEW] Ideal Joint Pose (작업에 최적화된 수직 자세)
+# -----------------------------------------------------------
+# [Base, Shoulder, Elbow, Wrist1, Wrist2, Wrist3]
+# 이 자세는 UR 로봇이 공구를 바닥으로 수직하게 향하고 있는 자세입니다.
+IDEAL_JOINT_POSE = [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
+
+# -----------------------------------------------------------
 # Utility Functions
 # -----------------------------------------------------------
 def get_ee_pose(env: ManagerBasedRLEnv, asset_name: str = "robot"):
@@ -94,7 +101,7 @@ def track_path_reward(env: ManagerBasedRLEnv, sigma: float = 0.1):
 
 def orientation_align_reward(env: ManagerBasedRLEnv):
     """
-    [수직 자세 강제 - 수정됨]
+    [수직 자세 강제 - 강력함]
     로봇 끝(Z축)이 바닥(-Z)을 향하지 않으면 점수를 급격하게 깎습니다.
     """
     ee_pose = get_ee_pose(env)
@@ -113,8 +120,28 @@ def orientation_align_reward(env: ManagerBasedRLEnv):
     dot_prod = torch.sum(tool_z_world * target_dir, dim=-1)
     
     # [핵심] 오차가 조금만 있어도 보상을 0에 가깝게 만듦 (Sharp Penalty)
+    # Scale을 30.0으로 높여서 아주 조금만 기울어도 점수 없음
     error = 1.0 - torch.clamp(dot_prod, min=-1.0, max=1.0)
-    return torch.exp(-error * 20.0)
+    return torch.exp(-error * 30.0)
+
+
+def joint_deviation_reward(env: ManagerBasedRLEnv):
+    """
+    [자세 유지]
+    로봇이 '이상적인 수직 작업 자세(IDEAL_JOINT_POSE)'에서 
+    너무 많이 벗어나지 않도록 잡아줍니다. 팔이 꼬이는 것을 방지합니다.
+    """
+    robot = env.scene["robot"]
+    current_joints = robot.data.joint_pos # (num_envs, 6)
+    
+    # 이상적인 자세 텐서 생성
+    target_joints = torch.tensor(IDEAL_JOINT_POSE, device=env.device).unsqueeze(0)
+    
+    # 관절 각도 차이의 L2 Norm 계산
+    diff = torch.norm(current_joints - target_joints, dim=-1)
+    
+    # 차이가 클수록 보상 감소
+    return torch.exp(-diff * 0.5)
 
 
 def force_control_reward(env: ManagerBasedRLEnv, target_force: float = 10.0):
@@ -183,21 +210,22 @@ def save_episode_plots(step: int):
     print(f"[{step}] Plots saved for Episode {_episode_counter}")
 
 # -----------------------------------------------------------
-# [Safety] Reset Logic
+# [Safety] Reset Logic (수정됨)
 # -----------------------------------------------------------
 def reset_robot_to_cobra(env: ManagerBasedRLEnv, env_ids: torch.Tensor):
     """
-    로봇이 태어날 때(Reset) 꼬이지 않도록 'Cobra Pose' 강제 주입
+    로봇이 태어날 때(Reset) 'Drill Ready' 자세(수직)로 강제 초기화합니다.
     """
     robot = env.scene["robot"]
-    # [Base, Shoulder, Elbow, Wrist1, Wrist2, Wrist3]
-    cobra_pose = torch.tensor([0.0, -2.0, 2.0, -1.57, -1.57, 0.0], device=env.device)
+    
+    # [수정됨] IDEAL_JOINT_POSE 사용
+    target_pose = torch.tensor(IDEAL_JOINT_POSE, device=env.device)
     
     joint_pos = robot.data.default_joint_pos[env_ids].clone()
-    joint_pos[:] = cobra_pose
+    joint_pos[:] = target_pose
 
     # 학습 다양성을 위한 약간의 노이즈
-    noise = (torch.rand_like(joint_pos) - 0.5) * 0.02
+    noise = (torch.rand_like(joint_pos) - 0.5) * 0.05 # 노이즈 범위 0.05로 살짝 증가
     joint_pos += noise
 
     joint_vel = torch.zeros_like(joint_pos)
