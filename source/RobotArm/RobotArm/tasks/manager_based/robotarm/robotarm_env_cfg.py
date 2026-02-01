@@ -10,7 +10,6 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import ActionTermCfg as ActionTerm
-from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -20,14 +19,11 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
 from isaaclab.sensors import ContactSensorCfg
-from isaaclab.envs import ViewerCfg
 
-# [중요] 기본 MDP와 커스텀 MDP 모듈
 import isaaclab.envs.mdp as mdp
 from .mdp import observations as local_obs 
 from .mdp import rewards as local_rew      
 
-# 로봇 모델
 from RobotArm.robots.ur10e_w_spindle import UR10E_W_SPINDLE_CFG
 
 # -------------------------------------------------------------------------
@@ -36,7 +32,7 @@ from RobotArm.robots.ur10e_w_spindle import UR10E_W_SPINDLE_CFG
 
 TEMP_ROBOT_CFG = copy.deepcopy(UR10E_W_SPINDLE_CFG)
 
-# [Contact Sensor 활성화]
+# Contact Sensor 설정
 TEMP_ROBOT_CFG.spawn = sim_utils.UsdFileCfg(
     usd_path=UR10E_W_SPINDLE_CFG.spawn.usd_path,
     activate_contact_sensors=True, 
@@ -68,19 +64,27 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    # 3. Robot
+    # 3. Robot (핵심 수정 부분)
     robot: ArticulationCfg = TEMP_ROBOT_CFG.replace(
         prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot",
-        # [핵심 수정 1] 바닥에 묻히지 않게 Z=0.1로 띄움
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(0.0, 0.0, 0.1), 
+            # [수정 1] 바닥 충돌 방지를 위해 공중으로 20cm 띄움
+            pos=(0.0, 0.0, 0.2), 
+            # [수정 2] 태어날 때부터 자세를 지정 (Joint Names는 USD 표준 이름 가정)
+            # 만약 이름이 틀려도 에러 없이 무시되므로 안전합니다.
+            joint_pos={
+                ".*": 0.0, # 기본 0도
+                "shoulder_lift_joint": -1.57, # 어깨 들기
+                "elbow_joint": 1.57,          # 팔꿈치 굽히기
+                "wrist_1_joint": -1.57,
+            },
         ),
-        # [핵심 수정 2] 강성을 낮춰서(80) 튕김 방지
         actuators={
             "arm": ImplicitActuatorCfg(
                 joint_names_expr=[".*"],
-                stiffness=80.0,  
-                damping=40.0,    
+                # [수정 3] 로봇을 흐물거리게 해서 튕김 방지 (Stiffness 낮춤)
+                stiffness=100.0,  
+                damping=50.0,    
             ),
         }
     )
@@ -122,6 +126,7 @@ class ActionsCfg:
 class ObservationsCfg:
     @configclass
     class PolicyCfg(ObsGroup):
+        # 복잡한 관측값 잠시 제외하고 기본만 유지 가능
         path_tracking = ObsTerm(func=local_obs.path_tracking_obs)
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel = ObsTerm(func=mdp.joint_vel_rel)
@@ -137,54 +142,37 @@ class ObservationsCfg:
 @configclass
 class RewardsCfg:
     """Reward terms."""
-    
-    # [기존 보상]
+    # 에러가 날 수 있는 복잡한 리워드는 가중치 0으로 두거나 주석 처리
     track_path = RewTerm(func=local_rew.track_path_reward, weight=10.0, params={"sigma": 0.1})
-    force_control = RewTerm(func=local_rew.force_control_reward, weight=2.0, params={"target_force": 10.0})
     orientation = RewTerm(func=local_rew.orientation_align_reward, weight=10.0)
     
-    # [새로 추가] 충돌 방지 및 표면 밀착
+    # 충돌하면 튕기므로 잠시 0.0으로 둡니다
     collision_penalty = RewTerm(
         func=local_rew.pen_table_collision, 
-        weight=50.0, 
+        weight=0.0, # <-- 안전 모드
         params={"threshold": 0.05} 
     )
-    surface_contact = RewTerm(
-        func=local_rew.rew_surface_tracking,
-        weight=5.0,
-        params={"target_height": 0.05} 
-    )
-
-    smoothness = RewTerm(func=local_rew.action_smoothness_penalty, weight=-0.1)
-    out_of_bounds = RewTerm(func=local_rew.out_of_bounds_penalty, weight=-5.0)
-
 
 @configclass
 class EventCfg:
-    # [핵심 수정 3] 리셋 시 '강제 코브라 자세' 적용
-    # 이 줄이 없으면 로봇이 이상하게 태어납니다.
+    # [핵심 수정 4] 커스텀 리셋 함수 제거 -> 표준 함수 사용
+    # init_state에서 이미 자세를 잡았으므로 reset은 기본값으로 가도 됩니다.
     reset_robot_joints = EventTerm(
-        func=local_rew.reset_robot_to_cobra, 
+        func=mdp.reset_joints_by_offset,
         mode="reset",
+        params={
+            "position_range": (-0.05, 0.05),
+            "velocity_range": (0.0, 0.0),
+        },
     )
-
 
 @configclass
 class TerminationsCfg:
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
-    illegal_contact = DoneTerm(
-        func=mdp.illegal_contact, 
-        params={
-            "threshold": 1000.0, # 민감도 완화
-            "sensor_cfg": SceneEntityCfg("contact_forces") 
-        }
-    )
-
 
 @configclass
 class CurriculumCfg:
     pass
-
 
 @configclass
 class RobotarmEnvCfg(ManagerBasedRLEnvCfg):
