@@ -52,7 +52,7 @@ except ImportError:
     pass
 
 # -----------------------------------------------------------
-# Global Logging Variables
+# Global Logging Variables (기존 코드 유지)
 # -----------------------------------------------------------
 _path_tracking_history = []
 _force_control_history = []
@@ -228,7 +228,7 @@ def rew_surface_tracking(env: ManagerBasedRLEnv, target_height: float = 0.0):
 
 
 # -----------------------------------------------------------
-# Visualization Logic
+# Visualization Logic (기존 코드 유지)
 # -----------------------------------------------------------
 def save_episode_plots(step: int):
     """에피소드 종료 시 데이터를 그래프로 저장"""
