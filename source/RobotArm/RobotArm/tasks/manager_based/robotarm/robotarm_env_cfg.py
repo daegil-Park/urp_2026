@@ -28,6 +28,20 @@ from .mdp import rewards as local_rew
 from RobotArm.robots.ur10e_w_spindle import UR10E_W_SPINDLE_CFG
 
 # -------------------------------------------------------------------------
+# [핵심] 수직 작업용 기본 자세 정의 (Radians)
+# -------------------------------------------------------------------------
+# UR 로봇 관절 이름에 맞춰 수직 자세를 딕셔너리로 정의합니다.
+# 이 자세가 이제 로봇의 "0점(Neutral Pose)"이 됩니다.
+DEVICE_READY_STATE = {
+    "shoulder_pan_joint": 0.0,
+    "shoulder_lift_joint": -1.5708, # -90 deg
+    "elbow_joint": 1.5708,          # 90 deg
+    "wrist_1_joint": -1.5708,       # -90 deg
+    "wrist_2_joint": -1.5708,       # -90 deg
+    "wrist_3_joint": 0.0,
+}
+
+# -------------------------------------------------------------------------
 # Scene Configuration
 # -------------------------------------------------------------------------
 
@@ -65,18 +79,18 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    # 3. Robot
+    # 3. Robot (설정 변경됨)
     robot: ArticulationCfg = TEMP_ROBOT_CFG.replace(
         prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot",
-        # [Safety] 바닥 충돌 방지 (Z=0.1)
+        # [중요] 초기 자세를 위에서 정의한 '수직 자세'로 고정
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(0.0, 0.0, 0.1), 
+            pos=(0.0, 0.0, 0.1),
+            joint_pos=DEVICE_READY_STATE, 
         ),
-        # [Safety] 부드러운 제어를 위한 강성 조절
         actuators={
             "arm": ImplicitActuatorCfg(
                 joint_names_expr=[".*"],
-                stiffness=80.0,  
+                stiffness=200.0,   # 강성을 좀 더 높여서 자세 유지력을 강화
                 damping=40.0,    
             ),
         }
@@ -106,6 +120,8 @@ class CommandsCfg:
 
 @configclass
 class ActionsCfg:
+    # [중요] use_default=True는 이제 위의 DEVICE_READY_STATE를 기준으로 동작합니다.
+    # 따라서 Action이 0이면 로봇은 수직 자세를 유지합니다.
     arm_action: ActionTerm = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=[".*"],
@@ -135,26 +151,26 @@ class ObservationsCfg:
 class RewardsCfg:
     """Reward terms."""
     
-    # [기본] 경로 추종
+    # 1. 경로 추종
     track_path = RewTerm(func=local_rew.track_path_reward, weight=10.0, params={"sigma": 0.1})
     
-    # [핵심 수정] 수직 자세 가중치 극한 상향 (40.0)
+    # 2. 수직 자세 (강력 유지)
     orientation = RewTerm(func=local_rew.orientation_align_reward, weight=40.0)
     
-    # [신규] 자세 유지 (팔 꼬임 방지)
+    # 3. 자세 유지 (팔 꼬임 방지)
     joint_reg = RewTerm(func=local_rew.joint_deviation_reward, weight=5.0)
     
-    # [기본] 힘 제어
+    # 4. 힘 제어
     force_control = RewTerm(func=local_rew.force_control_reward, weight=2.0, params={"target_force": 10.0})
 
-    # [Penalty]
+    # Penalty
     smoothness = RewTerm(func=local_rew.action_smoothness_penalty, weight=-0.1)
     out_of_bounds = RewTerm(func=local_rew.out_of_bounds_penalty, weight=-5.0)
 
 
 @configclass
 class EventCfg:
-    # [Safety] 리셋 시 수직 자세(Drill Ready) 강제
+    # 리셋 시에도 수직 자세로 강제 이동
     reset_robot_joints = EventTerm(
         func=local_rew.reset_robot_to_cobra, 
         mode="reset",
@@ -164,7 +180,6 @@ class EventCfg:
 @configclass
 class TerminationsCfg:
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
-    # 과도한 충돌 시 종료
     illegal_contact = DoneTerm(
         func=mdp.illegal_contact, 
         params={
