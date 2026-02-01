@@ -4,29 +4,50 @@ from __future__ import annotations
 import torch
 import math
 import os
+import csv
 import numpy as np
 from typing import TYPE_CHECKING
 
-# [시각화 관련]
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from isaaclab.assets import RigidObject
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import quat_apply
+from isaaclab.utils.math import (
+    matrix_from_euler, quat_apply, quat_mul, 
+    quat_from_euler_xyz, euler_xyz_from_quat, 
+    combine_frame_transforms, quat_error_magnitude, quat_rotate
+)
 from isaaclab.envs import ManagerBasedRLEnv
 
-# [입력 관련]
 try:
     import carb.input
 except ImportError:
     carb = None
 
-# [데이터 로더]
+from pxr import UsdGeom
+
+# [데이터 로더 유지]
 from . import path_loader
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
+
+# [FK Solver 유지]
+import sys
+if "nrs_fk_core" not in sys.modules:
+    try:
+        from nrs_fk_core import FKSolver
+    except ImportError:
+        FKSolver = None
+else:
+    FKSolver = sys.modules["nrs_fk_core"].FKSolver
+
+try:
+    from RobotArm.robots.ur10e_w_spindle import *
+except ImportError:
+    pass
 
 # -----------------------------------------------------------
 # Global Logging Variables
@@ -38,11 +59,20 @@ _episode_counter = 0
 # -----------------------------------------------------------
 # Utility Functions
 # -----------------------------------------------------------
+def angle_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    diff = (a - b + np.pi) % (2 * np.pi) - np.pi
+    return diff
+
 def get_ee_pose(env: ManagerBasedRLEnv, asset_name: str = "robot"):
     robot = env.scene[asset_name]
     pos = robot.data.body_pos_w[:, -1, :]
     quat = robot.data.body_quat_w[:, -1, :]
     return torch.cat([pos, quat], dim=-1)
+
+def _get_generated_target(env):
+    if hasattr(env, "pm"):
+        return env.pm.get_target_pose_from_path(env)
+    return torch.zeros(env.num_envs, 3, device=env.device)
 
 # -----------------------------------------------------------
 # Reward Functions
@@ -99,7 +129,7 @@ def force_control_reward(env: ManagerBasedRLEnv, target_force: float = 10.0):
 
 
 def orientation_align_reward(env: ManagerBasedRLEnv):
-    """[자세 유지] Tool이 바닥(-Z)을 바라보는지"""
+    """[자세 유지]"""
     ee_pose = get_ee_pose(env)
     ee_quat = ee_pose[:, 3:]
 
@@ -112,8 +142,7 @@ def orientation_align_reward(env: ManagerBasedRLEnv):
     target_dir[:, 2] = -1.0 
 
     dot_prod = torch.sum(tool_z_world * target_dir, dim=-1)
-    
-    return torch.clamp(dot_prod, min=-1.0, max=1.0)
+    return torch.clamp(dot_prod, min=0.0)
 
 
 def action_smoothness_penalty(env: ManagerBasedRLEnv):
@@ -136,57 +165,22 @@ def out_of_bounds_penalty(env: ManagerBasedRLEnv):
     
     return -1.0 * is_out
 
+# -----------------------------------------------------------
+# [새로 추가된 보상 함수들] - 물리 충돌 방지 및 표면 밀착
+# -----------------------------------------------------------
 def pen_table_collision(env: ManagerBasedRLEnv, threshold: float = 0.0):
-    """[충돌 방지] threshold보다 낮으면 강력한 벌점"""
     ee_pos = get_ee_pose(env)[:, :3]
-    
     is_under = (ee_pos[:, 2] < (threshold - 0.01)).float()
     penetration = (threshold - ee_pos[:, 2]).clamp(min=0.0)
-    
     return is_under * (-1.0 - penetration * 10.0)
 
 def rew_surface_tracking(env: ManagerBasedRLEnv, target_height: float = 0.0):
-    """[표면 밀착]"""
     ee_pos = get_ee_pose(env)[:, :3]
     z_error = torch.abs(ee_pos[:, 2] - target_height)
     return torch.exp(-z_error / 0.02)
 
-
 # -----------------------------------------------------------
-# [NEW] 강력한 초기화 함수 (Forced Reset)
-# -----------------------------------------------------------
-def reset_robot_to_cobra(env: ManagerBasedRLEnv, env_ids: torch.Tensor):
-    """
-    로봇을 무조건 Cobra Pose(작업 자세)로 강제 설정합니다.
-    기본 reset 함수가 USD의 default state(차렷 자세)를 불러오는 문제를 해결합니다.
-    """
-    # 1. 로봇 Asset 가져오기
-    robot = env.scene["robot"]
-
-    # 2. Cobra Pose 정의 (6 DOF)
-    # [Base, Shoulder, Elbow, Wrist1, Wrist2, Wrist3]
-    cobra_pose = torch.tensor([0.0, -2.0, 2.0, -1.57, -1.57, 0.0], device=env.device)
-    
-    # 3. 현재 관절 위치 가져오기
-    joint_pos = robot.data.default_joint_pos[env_ids].clone()
-
-    # 4. 모든 관절 값을 Cobra Pose로 덮어쓰기
-    # (Broadcasting: env_ids 개수만큼 복사)
-    joint_pos[:] = cobra_pose
-
-    # 5. 아주 미세한 랜덤 노이즈 추가 (학습 다양성)
-    noise = (torch.rand_like(joint_pos) - 0.5) * 0.02
-    joint_pos += noise
-
-    # 6. 속도는 0으로 초기화
-    joint_vel = torch.zeros_like(joint_pos)
-
-    # 7. 로봇 상태 강제 설정
-    robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
-    
-    
-# -----------------------------------------------------------
-# Visualization Logic
+# Visualization Logic (기존 코드 유지)
 # -----------------------------------------------------------
 def save_episode_plots(step: int):
     global _path_tracking_history, _force_control_history, _episode_counter
@@ -219,3 +213,49 @@ def save_episode_plots(step: int):
     _force_control_history.clear()
     _episode_counter += 1
     print(f"[{step}] Episode {_episode_counter} plots saved to {save_dir}")
+
+def check_coverage_success(env: ManagerBasedRLEnv):
+    return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+def manual_termination(env: ManagerBasedRLEnv):
+    if carb is None:
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    try:
+        input_i = carb.input.acquire_input_interface()
+        keyboard = input_i.get_keyboard()
+        if input_i.get_keyboard_value(keyboard, carb.input.KeyboardInput.K) > 0.5:
+            return torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+    except Exception:
+        pass
+    return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+
+# -----------------------------------------------------------
+# [핵심] 강제 리셋 함수 (새로 추가됨)
+# -----------------------------------------------------------
+def reset_robot_to_cobra(env: ManagerBasedRLEnv, env_ids: torch.Tensor):
+    """
+    로봇이 태어날 때(Reset) USD 기본 자세(차렷)가 아니라,
+    무조건 안전한 'Cobra Pose'로 시작하도록 강제합니다.
+    이 함수가 없으면 물리 엔진이 켜지는 순간 로봇이 바닥과 충돌하여 폭발합니다.
+    """
+    # 1. 로봇 Asset
+    robot = env.scene["robot"]
+
+    # 2. 안전한 초기 자세 (Cobra Pose)
+    # [Base, Shoulder, Elbow, Wrist1, Wrist2, Wrist3]
+    cobra_pose = torch.tensor([0.0, -2.0, 2.0, -1.57, -1.57, 0.0], device=env.device)
+    
+    # 3. broadcasting
+    joint_pos = robot.data.default_joint_pos[env_ids].clone()
+    joint_pos[:] = cobra_pose
+
+    # 4. 약간의 랜덤성 (학습용)
+    noise = (torch.rand_like(joint_pos) - 0.5) * 0.02
+    joint_pos += noise
+
+    # 5. 속도 0
+    joint_vel = torch.zeros_like(joint_pos)
+
+    # 6. 강제 주입
+    robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
