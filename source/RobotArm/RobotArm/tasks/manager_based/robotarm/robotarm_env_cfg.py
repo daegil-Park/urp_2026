@@ -22,12 +22,12 @@ from isaaclab.utils import configclass
 from isaaclab.sensors import ContactSensorCfg
 from isaaclab.envs import ViewerCfg
 
-# [필수 MDP 모듈]
+# [중요] 기본 MDP와 커스텀 MDP 모듈
 import isaaclab.envs.mdp as mdp
 from .mdp import observations as local_obs 
 from .mdp import rewards as local_rew      
 
-# [로봇 모델]
+# 로봇 모델
 from RobotArm.robots.ur10e_w_spindle import UR10E_W_SPINDLE_CFG
 
 # -------------------------------------------------------------------------
@@ -71,11 +71,11 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
     # 3. Robot
     robot: ArticulationCfg = TEMP_ROBOT_CFG.replace(
         prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot",
-        # [수정] 바닥 충돌 방지 (Z=0.05)
+        # [핵심 수정 1] 바닥에 묻히지 않게 Z=0.1로 띄움
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(0.0, 0.0, 0.05),
+            pos=(0.0, 0.0, 0.1), 
         ),
-        # [수정] 강성을 낮춰서(80) 폭발적인 반동 방지
+        # [핵심 수정 2] 강성을 낮춰서(80) 튕김 방지
         actuators={
             "arm": ImplicitActuatorCfg(
                 joint_names_expr=[".*"],
@@ -138,11 +138,12 @@ class ObservationsCfg:
 class RewardsCfg:
     """Reward terms."""
     
+    # [기존 보상]
     track_path = RewTerm(func=local_rew.track_path_reward, weight=10.0, params={"sigma": 0.1})
     force_control = RewTerm(func=local_rew.force_control_reward, weight=2.0, params={"target_force": 10.0})
     orientation = RewTerm(func=local_rew.orientation_align_reward, weight=10.0)
     
-    # [새로 추가] 물리 충돌 및 표면 밀착 보상
+    # [새로 추가] 충돌 방지 및 표면 밀착
     collision_penalty = RewTerm(
         func=local_rew.pen_table_collision, 
         weight=50.0, 
@@ -160,8 +161,8 @@ class RewardsCfg:
 
 @configclass
 class EventCfg:
-    # [핵심 수정] 리셋 시 '강제 코브라 자세' 적용
-    # 이 부분이 영상 속 문제를 해결하는 열쇠입니다.
+    # [핵심 수정 3] 리셋 시 '강제 코브라 자세' 적용
+    # 이 줄이 없으면 로봇이 이상하게 태어납니다.
     reset_robot_joints = EventTerm(
         func=local_rew.reset_robot_to_cobra, 
         mode="reset",
