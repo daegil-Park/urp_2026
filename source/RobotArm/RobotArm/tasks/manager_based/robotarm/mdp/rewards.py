@@ -8,7 +8,7 @@ import csv
 import numpy as np
 from typing import TYPE_CHECKING
 
-# [복구] 시각화 관련 라이브러리
+# [복구] 시각화 라이브러리 (GUI 충돌 방지 Agg 모드)
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -22,7 +22,7 @@ from isaaclab.utils.math import (
 )
 from isaaclab.envs import ManagerBasedRLEnv
 
-# [복구] 입력 인터페이스
+# [복구] Input 인터페이스
 try:
     import carb.input
 except ImportError:
@@ -30,14 +30,14 @@ except ImportError:
 
 from pxr import UsdGeom
 
-# [복구] 데이터 로더 임포트
+# [복구] 데이터 로더
 from . import path_loader
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
+# [복구] FK Solver 모듈
 import sys
-# [복구] FK Solver (이게 없어서 에러 났을 겁니다)
 if "nrs_fk_core" not in sys.modules:
     try:
         from nrs_fk_core import FKSolver
@@ -46,14 +46,13 @@ if "nrs_fk_core" not in sys.modules:
 else:
     FKSolver = sys.modules["nrs_fk_core"].FKSolver
 
-# [복구] 로봇 정의
 try:
     from RobotArm.robots.ur10e_w_spindle import *
 except ImportError:
     pass
 
 # -----------------------------------------------------------
-# Global Logging Variables (기존 유지)
+# Global Logging Variables (기존 데이터 유지)
 # -----------------------------------------------------------
 _path_tracking_history = []
 _force_control_history = []
@@ -67,7 +66,6 @@ def angle_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return diff
 
 def get_ee_pose(env: ManagerBasedRLEnv, asset_name: str = "robot"):
-    """Sim에서 제공하는 정확한 물리적 위치와 쿼터니언을 반환합니다."""
     robot = env.scene[asset_name]
     pos = robot.data.body_pos_w[:, -1, :]
     quat = robot.data.body_quat_w[:, -1, :]
@@ -79,11 +77,11 @@ def _get_generated_target(env):
     return torch.zeros(env.num_envs, 3, device=env.device)
 
 # -----------------------------------------------------------
-# Reward Functions (삭제된 것 없이 전부 복구)
+# Reward Functions (모두 복구됨)
 # -----------------------------------------------------------
 
 def track_path_reward(env: ManagerBasedRLEnv, sigma: float = 0.1):
-    """[경로 추종]"""
+    """[경로 추종 + 그래프 저장 트리거]"""
     global _path_tracking_history, _episode_counter
 
     path_tensor = path_loader.get_path_tensor(env.device)
@@ -101,7 +99,7 @@ def track_path_reward(env: ManagerBasedRLEnv, sigma: float = 0.1):
     if env.num_envs > 0:
         _path_tracking_history.append((step, min_dist[0].item()))
 
-    # [Visualization Trigger] 에피소드 종료 시 그래프 저장
+    # [Plot Saving Logic]
     if hasattr(env, "max_episode_length") and env.max_episode_length > 0:
         episode_steps = int(env.max_episode_length)
         if step > 0 and (step % episode_steps == episode_steps - 1):
@@ -111,7 +109,7 @@ def track_path_reward(env: ManagerBasedRLEnv, sigma: float = 0.1):
 
 
 def force_control_reward(env: ManagerBasedRLEnv, target_force: float = 10.0):
-    """[힘 제어]"""
+    """[힘 제어 + 로깅]"""
     global _force_control_history
 
     current_force = torch.zeros(env.num_envs, device=env.device)
@@ -133,9 +131,8 @@ def force_control_reward(env: ManagerBasedRLEnv, target_force: float = 10.0):
 
 
 def orientation_align_reward(env: ManagerBasedRLEnv):
-    """[자세 유지]"""
     ee_pose = get_ee_pose(env)
-    ee_quat = ee_pose[:, 3:] 
+    ee_quat = ee_pose[:, 3:]
 
     tool_z_local = torch.zeros((env.num_envs, 3), device=env.device)
     tool_z_local[:, 2] = 1.0 
@@ -146,7 +143,7 @@ def orientation_align_reward(env: ManagerBasedRLEnv):
 
     dot_prod = torch.sum(tool_z_world * target_dir, dim=-1)
     return torch.clamp(dot_prod, min=0.0)
-    
+
 
 def action_smoothness_penalty(env: ManagerBasedRLEnv):
     return -torch.sum(torch.square(env.action_manager.action), dim=-1)
@@ -159,34 +156,15 @@ def out_of_bounds_penalty(env: ManagerBasedRLEnv):
 
     is_out_x = (ee_pos[:, 0] < (wp_pos_x - wp_size_x)) | (ee_pos[:, 0] > (wp_pos_x + wp_size_x))
     is_out_y = (ee_pos[:, 1] < (wp_pos_y - wp_size_y)) | (ee_pos[:, 1] > (wp_pos_y + wp_size_y))
-    is_out_z = (ee_pos[:, 2] < 0.0) | (ee_pos[:, 2] > 0.8) 
+    is_out_z = (ee_pos[:, 2] < 0.0) | (ee_pos[:, 2] > 0.8)
 
     is_out = (is_out_x | is_out_y | is_out_z).float()
     return -1.0 * is_out
 
 # -----------------------------------------------------------
-# [NEW] 물리 충돌 방지 및 표면 밀착 (새로 추가)
-# -----------------------------------------------------------
-
-def pen_table_collision(env: ManagerBasedRLEnv, threshold: float = 0.0):
-    """테이블 뚫으면 강력한 벌점"""
-    ee_pos = get_ee_pose(env)[:, :3]
-    is_under = (ee_pos[:, 2] < (threshold - 0.01)).float()
-    penetration = (threshold - ee_pos[:, 2]).clamp(min=0.0)
-    return is_under * (-1.0 - penetration * 10.0)
-
-def rew_surface_tracking(env: ManagerBasedRLEnv, target_height: float = 0.0):
-    """표면 높이 유지"""
-    ee_pos = get_ee_pose(env)[:, :3]
-    z_error = torch.abs(ee_pos[:, 2] - target_height)
-    return torch.exp(-z_error / 0.02)
-
-
-# -----------------------------------------------------------
-# Visualization Logic (이 부분 다 날려서 죄송합니다. 복구했습니다.)
+# [Visualization Logic] - 복구됨
 # -----------------------------------------------------------
 def save_episode_plots(step: int):
-    """에피소드 종료 시 그래프 저장"""
     global _path_tracking_history, _force_control_history, _episode_counter
     
     save_dir = os.path.expanduser("~/nrs_lab2/outputs/png/")
@@ -218,10 +196,8 @@ def save_episode_plots(step: int):
     _episode_counter += 1
     print(f"[{step}] Episode {_episode_counter} plots saved to {save_dir}")
 
-
 def check_coverage_success(env: ManagerBasedRLEnv):
     return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-
 
 def manual_termination(env: ManagerBasedRLEnv):
     if carb is None:
@@ -235,28 +211,29 @@ def manual_termination(env: ManagerBasedRLEnv):
         pass
     return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
 
+
 # -----------------------------------------------------------
-# [NEW - 여기가 핵심] 강제 리셋 함수
+# [NEW] 로봇 안정화 함수 (유일한 추가 사항)
 # -----------------------------------------------------------
 def reset_robot_to_cobra(env: ManagerBasedRLEnv, env_ids: torch.Tensor):
     """
-    로봇이 태어날 때(Reset) USD 기본 자세(차렷)가 아니라,
-    무조건 안전한 'Cobra Pose'로 시작하도록 강제합니다.
+    로봇이 태어날 때 바닥에 처박히지 않도록 강제로 'Cobra Pose'를 주입합니다.
     """
     robot = env.scene["robot"]
-
+    
     # [Base, Shoulder, Elbow, Wrist1, Wrist2, Wrist3]
-    # 팔을 뒤로 젖히고 앞으로 숙인 자세 (안전 자세)
+    # 팔을 들고 있는 안전한 자세
     cobra_pose = torch.tensor([0.0, -2.0, 2.0, -1.57, -1.57, 0.0], device=env.device)
     
+    # joint_pos 타겟 생성
     joint_pos = robot.data.default_joint_pos[env_ids].clone()
     joint_pos[:] = cobra_pose
 
-    # 약간의 랜덤성 (학습 다양성)
+    # 약간의 노이즈 (학습용)
     noise = (torch.rand_like(joint_pos) - 0.5) * 0.02
     joint_pos += noise
 
     joint_vel = torch.zeros_like(joint_pos)
 
-    # 시뮬레이션에 강제 주입
+    # 시뮬레이션 상태 강제 덮어쓰기
     robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
