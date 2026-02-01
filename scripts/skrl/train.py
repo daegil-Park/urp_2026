@@ -3,15 +3,14 @@
 
 """
 Script to train RL agent with skrl.
-
-Visit the skrl documentation (https://skrl.readthedocs.io) to see the examples structured in
-a more user-friendly way.
 """
 
 """Launch Isaac Sim Simulator first."""
 
 import argparse
 import sys
+import os
+import random
 
 from isaaclab.app import AppLauncher
 
@@ -76,8 +75,6 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import gymnasium as gym
-import os
-import random
 import torch
 
 import skrl
@@ -184,11 +181,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)
 
     # configure and instantiate the skrl runner
-    # https://skrl.readthedocs.io/en/latest/api/utils/runner.html
     runner = Runner(env, experiment_cfg)
 
-    # [복구된 부분] 설정 저장 (재현 가능성)
-    if experiment_cfg["agent"]["experiment"]["write_interval"] > 0:
+    # [수정된 부분] write_interval 타입 체크 (문자열 'auto' 등으로 인한 에러 방지)
+    write_interval = experiment_cfg["agent"]["experiment"]["write_interval"]
+    should_write = False
+    
+    # 1. 정수형(int)이고 0보다 큰 경우
+    if isinstance(write_interval, int) and write_interval > 0:
+        should_write = True
+    # 2. 문자열인데 숫자로 변환 가능한 경우 (예: "1000")
+    elif isinstance(write_interval, str) and write_interval.isdigit() and int(write_interval) > 0:
+        should_write = True
+    
+    if should_write:
         filename = os.path.join(log_root_path, "env_cfg.pickle")
         dump_pickle(filename, env_cfg)
         filename = os.path.join(log_root_path, "experiment_cfg.yaml")
