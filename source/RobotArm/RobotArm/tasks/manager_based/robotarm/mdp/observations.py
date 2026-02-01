@@ -54,8 +54,7 @@ def get_ee_pose(env: ManagerBasedRLEnv, asset_name: str = "robot", use_fk: bool 
     robot = env.scene[asset_name]
     
     if use_fk and FKSolver is not None:
-        # [Option A] FK Solver 사용 (Code 2 Reference)
-        # 주의: Python Loop로 인해 대량의 환경에서 느려질 수 있음
+        # [Option A] FK Solver 사용
         q = robot.data.joint_pos[:, :6]
         num_envs = q.shape[0]
         fk_solver = FKSolver(tool_z=0.239, use_degrees=False)
@@ -81,7 +80,7 @@ def get_ee_pose(env: ManagerBasedRLEnv, asset_name: str = "robot", use_fk: bool 
 
 
 # ------------------------------------------------------
-# Utility: Contact Sensor Forces (Code 2 Style)
+# Utility: Contact Sensor Forces
 # ------------------------------------------------------
 def get_contact_forces(env: ManagerBasedRLEnv, sensor_name="contact_forces"):
     """
@@ -95,8 +94,7 @@ def get_contact_forces(env: ManagerBasedRLEnv, sensor_name="contact_forces"):
     # net_forces_w: (num_envs, num_links, 3)
     forces_w = sensor.data.net_forces_w
     
-    # 여기서는 Z축 힘의 크기(Norm)를 주로 사용 (Code 1 Logic 반영)
-    # 필요하다면 Code 2처럼 wrench 전체를 반환하도록 수정 가능
+    # Z축 힘의 크기(Norm)
     force_z = torch.norm(forces_w[..., 2], dim=-1, keepdim=True)  # (num_envs, 1)
     
     # Clipping (Safety)
@@ -106,29 +104,25 @@ def get_contact_forces(env: ManagerBasedRLEnv, sensor_name="contact_forces"):
 
 
 # ------------------------------------------------------
-# Main Observation: Path Tracking
+# Main Observation: Path Tracking (핵심 수정됨)
 # ------------------------------------------------------
 def path_tracking_obs(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg = None) -> torch.Tensor:
     """
     로봇 EE와 txt 파일 경로(path_loader) 사이의 관계를 관측합니다.
-    Ref: Code 1 Logic + Code 2 Structure
+    [변경점] 반환값에 ee_quat(현재 회전)을 추가하여 로봇이 자신의 기울기를 알 수 있게 함.
     """
     device = env.device
     
     # 1. txt 파일 데이터 가져오기 (via path_loader)
-    # (num_points, 3)
     path_data = path_loader.get_path_tensor(device)
 
-    # 2. 로봇 현재 위치 (Sim Ground Truth for speed)
+    # 2. 로봇 현재 위치 및 회전 (Sim Ground Truth)
     robot = env.scene["robot"]
-    ee_pos = robot.data.body_pos_w[:, -1, :]  # (num_envs, 3)
+    ee_pos = robot.data.body_pos_w[:, -1, :]   # (num_envs, 3)
+    ee_quat = robot.data.body_quat_w[:, -1, :] # (num_envs, 4) -> [NEW] 추가됨
 
     # 3. 가장 가까운 목표점 찾기 (Distance Based)
-    # Broadcasting: (N, 1, 3) - (1, M, 3) -> (N, M, 3)
-    # 메모리 효율을 위해 청크 처리가 필요할 수도 있으나, 점이 수천 개 수준이면 괜찮음
     dists = torch.norm(ee_pos.unsqueeze(1) - path_data.unsqueeze(0), dim=2)
-    
-    # 최소 거리 인덱스 추출
     min_dists, min_indices = torch.min(dists, dim=1)
     
     # 해당 인덱스의 목표 위치 가져오기
@@ -137,12 +131,13 @@ def path_tracking_obs(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg = None)
     # 4. 오차 계산 (Vector)
     pos_error = target_pos - ee_pos
 
-    # 5. 힘 센서 데이터 (Helper 함수 사용)
+    # 5. 힘 센서 데이터
     force_z = get_contact_forces(env)
 
-    # 6. 관측 반환 (Pos Error + Force + Current Pos)
-    # 차원: 3 + 1 + 3 = 7
-    return torch.cat([pos_error, force_z, ee_pos], dim=-1)
+    # 6. 관측 반환 (Pos Error + Force + Current Pos + Current Rot)
+    # 기존: 3 + 1 + 3 = 7
+    # 변경: 3(error) + 1(force) + 3(pos) + 4(quat) = 11 차원
+    return torch.cat([pos_error, force_z, ee_pos, ee_quat], dim=-1)
 
 
 # ------------------------------------------------------
