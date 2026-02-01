@@ -1,3 +1,4 @@
+# 파일 경로: RobotArm/tasks/manager_based/robotarm/mdp/rewards.py
 from __future__ import annotations
 
 import torch
@@ -17,7 +18,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import (
     matrix_from_euler, quat_apply, quat_mul, 
     quat_from_euler_xyz, euler_xyz_from_quat, 
-    combine_frame_transforms, quat_error_magnitude
+    combine_frame_transforms, quat_error_magnitude, quat_rotate
 )
 from isaaclab.envs import ManagerBasedRLEnv
 
@@ -37,14 +38,21 @@ if TYPE_CHECKING:
 
 import sys
 if "nrs_fk_core" not in sys.modules:
-    from nrs_fk_core import FKSolver
+    try:
+        from nrs_fk_core import FKSolver
+    except ImportError:
+        FKSolver = None
 else:
     FKSolver = sys.modules["nrs_fk_core"].FKSolver
 
-from RobotArm.robots.ur10e_w_spindle import *
+# 로봇 정의가 있다면 유지 (없으면 패스)
+try:
+    from RobotArm.robots.ur10e_w_spindle import *
+except ImportError:
+    pass
 
 # -----------------------------------------------------------
-# Global Logging Variables (Code B 스타일 적용)
+# Global Logging Variables
 # -----------------------------------------------------------
 _path_tracking_history = []
 _force_control_history = []
@@ -71,24 +79,17 @@ def get_ee_pose(env: ManagerBasedRLEnv, asset_name: str = "robot"):
 # -----------------------------------------------------------
 def _get_generated_target(env):
     """observation_1.py와 동일한 로직을 유지"""
-    # path_manager를 통해 CSV 경로 반환 (path_loader 내부 로직 의존)
-    # env에 pm(PathManager)이 인스턴스로 존재한다고 가정
     if hasattr(env, "pm"):
         return env.pm.get_target_pose_from_path(env)
-    
-    # pm이 없는 경우를 대비한 Fallback (또는 path_loader의 전역 함수 사용)
-    # 여기서는 path_loader가 전역적으로 관리된다면 아래와 같이 처리 가능
-    # return path_loader.get_target_pose(env)
     return torch.zeros(env.num_envs, 3, device=env.device)
 
 # -----------------------------------------------------------
-# Reward Functions
+# Reward Functions (Original + New Solutions)
 # -----------------------------------------------------------
 
 def track_path_reward(env: ManagerBasedRLEnv, sigma: float = 0.1):
     """
     [경로 추종] 현재 위치가 경로상의 가장 가까운 점과 얼마나 가까운지 평가
-    + Code B 스타일의 로깅 및 시각화 트리거 추가
     """
     global _path_tracking_history, _episode_counter
 
@@ -102,7 +103,6 @@ def track_path_reward(env: ManagerBasedRLEnv, sigma: float = 0.1):
     current_pos = ee_pose[:, :3] # (num_envs, 3)
 
     # 3. 경로상의 점들과의 거리 계산 (Broadcasting)
-    # (num_envs, 1, 3) - (1, num_points, 3) -> (num_envs, num_points, 3)
     dists = torch.norm(current_pos.unsqueeze(1) - path_tensor.unsqueeze(0), dim=2)
     
     # 4. 가장 가까운 거리(Minimum Distance) 추출
@@ -110,13 +110,12 @@ def track_path_reward(env: ManagerBasedRLEnv, sigma: float = 0.1):
 
     # 5. [Logging] 첫 번째 환경(env 0)에 대해서만 기록
     step = int(env.common_step_counter)
-    # 기록: (Step, Min_Distance)
-    _path_tracking_history.append((step, min_dist[0].item()))
+    if env.num_envs > 0:
+        _path_tracking_history.append((step, min_dist[0].item()))
 
     # 6. [Visualization Trigger] 에피소드 종료 시 그래프 저장
     if hasattr(env, "max_episode_length") and env.max_episode_length > 0:
         episode_steps = int(env.max_episode_length)
-        # 마지막 스텝에서 저장
         if step > 0 and (step % episode_steps == episode_steps - 1):
             save_episode_plots(step)
 
@@ -135,29 +134,25 @@ def force_control_reward(env: ManagerBasedRLEnv, target_force: float = 10.0):
     # 1. 센서 데이터 가져오기
     if "contact_forces" in env.scene.sensors:
         sensor = env.scene["contact_forces"]
-        # net_forces_w: (num_envs, num_links, 3)
-        # 센서 데이터가 비어있지 않은지 확인
         if sensor.data.net_forces_w is not None and sensor.data.net_forces_w.shape[1] > 0:
             force_z = torch.abs(sensor.data.net_forces_w[..., 2])
-            # 여러 링크 중 최대 힘 사용
             current_force, _ = torch.max(force_z, dim=-1)
     
     # 2. 오차 계산
     force_error = torch.abs(current_force - target_force)
 
-    # 3. [Logging] 첫 번째 환경(env 0)에 대해서만 기록
-    # 기록: (Step, Current_Force, Target_Force)
+    # 3. [Logging]
     step = int(env.common_step_counter)
-    _force_control_history.append((step, current_force[0].item(), target_force))
+    if env.num_envs > 0:
+        _force_control_history.append((step, current_force[0].item(), target_force))
 
-    # 4. 보상 반환 (분모에 epsilon 추가하여 안전성 확보)
+    # 4. 보상 반환
     return 1.0 / (1.0 + 0.1 * force_error)
 
 
 def orientation_align_reward(env: ManagerBasedRLEnv):
     """
-    [자세 유지] Tool이 바닥(-Z)을 수직으로 바라보는지 평가
-    Code B의 Math utils 활용 가능성 열어둠
+    [자세 유지 - 기존 버전] Tool이 바닥(-Z)을 수직으로 바라보는지 평가
     """
     ee_pose = get_ee_pose(env)
     ee_quat = ee_pose[:, 3:] # (qx, qy, qz, qw)
@@ -180,74 +175,89 @@ def orientation_align_reward(env: ManagerBasedRLEnv):
     
 
 def action_smoothness_penalty(env: ManagerBasedRLEnv):
-    """
-    [부드러움] Action 값의 크기 억제 (에너지 최소화)
-    """
+    """[부드러움] Action 값의 크기 억제"""
     return -torch.sum(torch.square(env.action_manager.action), dim=-1)
 
 
 def out_of_bounds_penalty(env: ManagerBasedRLEnv):
-    """
-    [이탈 방지] 작업 영역 벗어나면 벌점
-    """
+    """[이탈 방지] 작업 영역 벗어나면 벌점"""
     ee_pos = get_ee_pose(env)[:, :3]
     
-    # 작업 영역 설정 (필요시 env.cfg에서 가져오도록 수정 가능)
     wp_pos_x, wp_pos_y = 0.5, 0.0
     wp_size_x, wp_size_y = 0.6, 0.6 
 
     is_out_x = (ee_pos[:, 0] < (wp_pos_x - wp_size_x)) | (ee_pos[:, 0] > (wp_pos_x + wp_size_x))
     is_out_y = (ee_pos[:, 1] < (wp_pos_y - wp_size_y)) | (ee_pos[:, 1] > (wp_pos_y + wp_size_y))
-    is_out_z = (ee_pos[:, 2] < 0.0) | (ee_pos[:, 2] > 0.6) # 상한선 약간 여유
+    is_out_z = (ee_pos[:, 2] < 0.0) | (ee_pos[:, 2] > 0.8) # 상한선 여유
 
     is_out = (is_out_x | is_out_y | is_out_z).float()
     
     return -1.0 * is_out
 
+# -----------------------------------------------------------
+# [NEW] 솔루션 추가 함수들 (물리적 제약 강화)
+# -----------------------------------------------------------
+
+def pen_table_collision(env: ManagerBasedRLEnv, threshold: float = 0.0):
+    """
+    [물리 충돌 방지] 작업물 높이(threshold)보다 낮게 내려가면(뚫으면) 강력한 페널티.
+    """
+    ee_pos = get_ee_pose(env)[:, :3]
+    
+    # threshold보다 낮으면 1 (충돌), 아니면 0
+    # 안전 마진 1cm (0.01) 고려
+    is_under = (ee_pos[:, 2] < (threshold - 0.01)).float()
+    
+    # 뚫고 들어간 깊이
+    penetration = (threshold - ee_pos[:, 2]).clamp(min=0.0)
+    
+    # 충돌 시 기본 벌점(-1.0) + 깊이에 비례한 벌점(-10.0 * depth)
+    return is_under * (-1.0 - penetration * 10.0)
+
+def rew_surface_tracking(env: ManagerBasedRLEnv, target_height: float = 0.0):
+    """
+    [표면 밀착] 공중에서 휘적거리지 않고 표면 높이(Target Height) 근처를 유지하도록 유도.
+    """
+    ee_pos = get_ee_pose(env)[:, :3]
+    
+    # Z축 오차 절대값
+    z_error = torch.abs(ee_pos[:, 2] - target_height)
+    
+    # 2cm 이내면 보상 (Sharp Gaussian)
+    return torch.exp(-z_error / 0.02)
+
 
 # -----------------------------------------------------------
-# Visualization Logic (From Code B)
+# Visualization Logic
 # -----------------------------------------------------------
 def save_episode_plots(step: int):
     """에피소드 종료 시 데이터를 그래프로 저장"""
     global _path_tracking_history, _force_control_history, _episode_counter
     
-    # 저장 경로 설정
     save_dir = os.path.expanduser("~/nrs_lab2/outputs/png/")
     os.makedirs(save_dir, exist_ok=True)
 
-    # 1. Path Tracking Plot
     if _path_tracking_history:
         steps, dists = zip(*_path_tracking_history)
-        
         plt.figure(figsize=(10, 5))
         plt.plot(steps, dists, label="Distance to Path", color="blue")
         plt.title(f"Path Tracking Error (Ep {_episode_counter + 1})")
-        plt.xlabel("Step")
-        plt.ylabel("Distance [m]")
-        plt.grid(True)
-        plt.legend()
-        plt.tight_layout()
+        plt.xlabel("Step"); plt.ylabel("Distance [m]")
+        plt.grid(True); plt.legend(); plt.tight_layout()
         plt.savefig(os.path.join(save_dir, f"path_error_ep{_episode_counter + 1}.png"))
         plt.close()
 
-    # 2. Force Control Plot
     if _force_control_history:
         steps, currents, targets = zip(*_force_control_history)
-        
         plt.figure(figsize=(10, 5))
         plt.plot(steps, currents, label="Current Force", color="red")
         plt.plot(steps, targets, "--", label="Target Force", color="green")
         plt.title(f"Force Control (Ep {_episode_counter + 1})")
-        plt.xlabel("Step")
-        plt.ylabel("Force [N]")
-        plt.grid(True)
-        plt.legend()
-        plt.tight_layout()
+        plt.xlabel("Step"); plt.ylabel("Force [N]")
+        plt.grid(True); plt.legend(); plt.tight_layout()
         plt.savefig(os.path.join(save_dir, f"force_control_ep{_episode_counter + 1}.png"))
         plt.close()
 
-    # 데이터 초기화 및 카운터 증가
     _path_tracking_history.clear()
     _force_control_history.clear()
     _episode_counter += 1
@@ -255,18 +265,12 @@ def save_episode_plots(step: int):
 
 
 def check_coverage_success(env: ManagerBasedRLEnv):
-    """종료 조건: 기본적으로 False (타임아웃까지 수행)"""
     return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
 
 
 def manual_termination(env: ManagerBasedRLEnv):
-    """
-    'K' 키를 누르면 강제 종료 (리셋)
-    headless 모드에서 carb가 없을 경우 안전하게 패스
-    """
     if carb is None:
         return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-
     try:
         input_i = carb.input.acquire_input_interface()
         keyboard = input_i.get_keyboard()
@@ -274,5 +278,4 @@ def manual_termination(env: ManagerBasedRLEnv):
             return torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
     except Exception:
         pass
-        
     return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
