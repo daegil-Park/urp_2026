@@ -135,11 +135,14 @@ class ObservationsCfg:
 class RewardsCfg:
     """Reward terms."""
     
-    # [기본] 경로 추종 (그래프 저장 포함)
+    # [기본] 경로 추종
     track_path = RewTerm(func=local_rew.track_path_reward, weight=10.0, params={"sigma": 0.1})
     
-    # [핵심 수정] 수직 자세 가중치 대폭 상향 (10.0 -> 25.0)
-    orientation = RewTerm(func=local_rew.orientation_align_reward, weight=25.0)
+    # [핵심 수정] 수직 자세 가중치 극한 상향 (40.0)
+    orientation = RewTerm(func=local_rew.orientation_align_reward, weight=40.0)
+    
+    # [신규] 자세 유지 (팔 꼬임 방지)
+    joint_reg = RewTerm(func=local_rew.joint_deviation_reward, weight=5.0)
     
     # [기본] 힘 제어
     force_control = RewTerm(func=local_rew.force_control_reward, weight=2.0, params={"target_force": 10.0})
@@ -151,7 +154,7 @@ class RewardsCfg:
 
 @configclass
 class EventCfg:
-    # [Safety] 리셋 시 안전한 자세(Cobra Pose) 강제
+    # [Safety] 리셋 시 수직 자세(Drill Ready) 강제
     reset_robot_joints = EventTerm(
         func=local_rew.reset_robot_to_cobra, 
         mode="reset",
