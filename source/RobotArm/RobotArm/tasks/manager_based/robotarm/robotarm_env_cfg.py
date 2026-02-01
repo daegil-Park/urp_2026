@@ -63,16 +63,22 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
         init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0)),
     )
 
-    # 2. Workpiece
+    # 2. Workpiece (물리 속성이 확실한 Cube로 교체)
+    # 기존 USD 파일 대신, 코드로 생성된 '단단한 상자'를 배치합니다.
     workpiece = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Workpiece",
-        spawn=sim_utils.UsdFileCfg(
-            usd_path="/home/eunseop/isaac/isaac_save/flat_surface_2.usd",
-            scale=(1.0, 1.0, 1.0),
+        spawn=sim_utils.CuboidCfg(
+            size=(0.5, 0.5, 0.1),  # 가로 0.5m, 세로 0.5m, 높이 0.1m
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.8, 0.8, 0.8)), # 회색
+            # [핵심] 물리 충돌 속성 강제 부여
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=True, # 로봇이 밀어도 움직이지 않음 (고정)
+                disable_gravity=True,
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(), # 충돌 활성화
         ),
         init_state=AssetBaseCfg.InitialStateCfg(
-            pos=(0.75, 0.0, 0.0),
-            rot=(1.0, 0.0, 0.0, 0.0),
+            pos=(0.75, 0.0, 0.05), # 높이의 절반(0.05)만큼 올려서 바닥 위에 안착
         ),
     )
 
@@ -80,22 +86,19 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
     robot: ArticulationCfg = TEMP_ROBOT_CFG.replace(
         prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot",
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(0.0, 0.0, 0.1),
+            pos=(0.0, 0.0, 0.0), # 로봇 베이스 높이 0.0
             joint_pos=DEVICE_READY_STATE, 
         ),
-        # [핵심 변경] 물리 물성 튜닝 (Soft & Damped)
         actuators={
             "arm": ImplicitActuatorCfg(
                 joint_names_expr=[".*"],
-                # Stiffness를 200 -> 80으로 낮춤 (표면에 닿았을 때 튕기지 않고 눌리도록)
-                stiffness=80.0,  
-                # Damping은 적절히 유지 (진동 흡수)
-                damping=40.0,    
+                stiffness=80.0,   # 부드럽게
+                damping=40.0,     # 진동 방지
             ),
         }
     )
 
-    # 4. Sensors
+    # 4. Sensors (충돌 감지)
     contact_forces = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot/.*", 
         history_length=3,
@@ -119,13 +122,10 @@ class CommandsCfg:
 
 @configclass
 class ActionsCfg:
-    # [핵심 변경] Action Scale 축소
-    # 로봇이 한 번에 너무 많이 움직이지 못하게 막습니다. (0.05 -> 0.01)
-    # 이것이 "뚫고 지나가는" 현상을 막는 가장 큰 열쇠입니다.
     arm_action: ActionTerm = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=[".*"],
-        scale=0.01, 
+        scale=0.01, # 세밀한 움직임
         use_default=True, 
     )
     gripper_action: ActionTerm | None = None
@@ -150,25 +150,18 @@ class ObservationsCfg:
 @configclass
 class RewardsCfg:
     """Reward terms."""
-    
-    # 1. 경로 추종
+    # 보상 함수들은 기존과 동일
     track_path = RewTerm(func=local_rew.track_path_reward, weight=10.0, params={"sigma": 0.1})
-    
-    # 2. 수직 자세 (유지)
     orientation = RewTerm(func=local_rew.orientation_align_reward, weight=40.0)
-    
-    # 3. 자세 유지
     joint_reg = RewTerm(func=local_rew.joint_deviation_reward, weight=5.0)
-    
-    # 4. 힘 제어
     force_control = RewTerm(func=local_rew.force_control_reward, weight=2.0, params={"target_force": 10.0})
 
-    # [Penalty]
-    # [신규] 속도 페널티 (너무 빨리 움직이면 벌점)
+    # Penalties
     joint_vel = RewTerm(func=local_rew.joint_vel_penalty, weight=-0.05)
-    
     smoothness = RewTerm(func=local_rew.action_smoothness_penalty, weight=-0.1)
-    out_of_bounds = RewTerm(func=local_rew.out_of_bounds_penalty, weight=-5.0)
+    
+    # [수정] 바닥 뚫기 방지 (보상 대신 종료 조건으로 더 강력하게 제재)
+    out_of_bounds = RewTerm(func=local_rew.out_of_bounds_penalty, weight=-10.0)
 
 
 @configclass
@@ -182,12 +175,12 @@ class EventCfg:
 @configclass
 class TerminationsCfg:
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
-    illegal_contact = DoneTerm(
-        func=mdp.illegal_contact, 
-        params={
-            "threshold": 1000.0, 
-            "sensor_cfg": SceneEntityCfg("contact_forces") 
-        }
+    
+    # [추가] "Floor is Lava" - 표면 아래로 내려가면 즉시 사망(Reset)
+    # 물리적 충돌뿐만 아니라 좌표적으로도 Z가 0보다 낮아지면 에피소드를 강제 종료합니다.
+    underground_death = DoneTerm(
+        func=mdp.root_height_below_minimum,
+        params={"minimum_height": -0.05, "asset_cfg": SceneEntityCfg("robot")}
     )
 
 
