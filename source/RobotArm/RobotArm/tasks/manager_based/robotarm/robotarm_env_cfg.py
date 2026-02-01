@@ -10,7 +10,6 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import ActionTermCfg as ActionTerm
-from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -20,8 +19,8 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
 from isaaclab.sensors import ContactSensorCfg
-from isaaclab.envs import ViewerCfg
 
+# Custom MDP modules
 import isaaclab.envs.mdp as mdp
 from .mdp import observations as local_obs 
 from .mdp import rewards as local_rew      
@@ -34,7 +33,7 @@ from RobotArm.robots.ur10e_w_spindle import UR10E_W_SPINDLE_CFG
 
 TEMP_ROBOT_CFG = copy.deepcopy(UR10E_W_SPINDLE_CFG)
 
-# Contact Sensor 활성화 (기존 동일)
+# Contact Sensor Enable
 TEMP_ROBOT_CFG.spawn = sim_utils.UsdFileCfg(
     usd_path=UR10E_W_SPINDLE_CFG.spawn.usd_path,
     activate_contact_sensors=True, 
@@ -66,14 +65,14 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    # 3. Robot (여기가 중요 수정 포인트)
+    # 3. Robot
     robot: ArticulationCfg = TEMP_ROBOT_CFG.replace(
         prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot",
-        # [수정] 바닥 충돌 방지를 위해 Z축 10cm 상승
+        # [Safety] 바닥 충돌 방지 (Z=0.1)
         init_state=ArticulationCfg.InitialStateCfg(
             pos=(0.0, 0.0, 0.1), 
         ),
-        # [수정] 강성을 80으로 낮춰서 로봇이 얌전해지게 함
+        # [Safety] 부드러운 제어를 위한 강성 조절
         actuators={
             "arm": ImplicitActuatorCfg(
                 joint_names_expr=[".*"],
@@ -98,7 +97,7 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
 
 
 # -------------------------------------------------------------------------
-# MDP Settings (기존 기능 모두 유지)
+# MDP Settings
 # -------------------------------------------------------------------------
 
 @configclass
@@ -134,20 +133,25 @@ class ObservationsCfg:
 
 @configclass
 class RewardsCfg:
-    """Reward terms (기존 보상 유지)."""
+    """Reward terms."""
     
+    # [기본] 경로 추종 (그래프 저장 포함)
     track_path = RewTerm(func=local_rew.track_path_reward, weight=10.0, params={"sigma": 0.1})
-    force_control = RewTerm(func=local_rew.force_control_reward, weight=2.0, params={"target_force": 10.0})
-    orientation = RewTerm(func=local_rew.orientation_align_reward, weight=10.0)
     
+    # [핵심 수정] 수직 자세 가중치 대폭 상향 (10.0 -> 25.0)
+    orientation = RewTerm(func=local_rew.orientation_align_reward, weight=25.0)
+    
+    # [기본] 힘 제어
+    force_control = RewTerm(func=local_rew.force_control_reward, weight=2.0, params={"target_force": 10.0})
+
+    # [Penalty]
     smoothness = RewTerm(func=local_rew.action_smoothness_penalty, weight=-0.1)
     out_of_bounds = RewTerm(func=local_rew.out_of_bounds_penalty, weight=-5.0)
 
 
 @configclass
 class EventCfg:
-    # [핵심] 리셋 시 '강제 코브라 자세' 함수 호출
-    # 로봇이 꺾인 채로 태어나 튕기는 현상을 막아줍니다.
+    # [Safety] 리셋 시 안전한 자세(Cobra Pose) 강제
     reset_robot_joints = EventTerm(
         func=local_rew.reset_robot_to_cobra, 
         mode="reset",
@@ -157,6 +161,7 @@ class EventCfg:
 @configclass
 class TerminationsCfg:
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
+    # 과도한 충돌 시 종료
     illegal_contact = DoneTerm(
         func=mdp.illegal_contact, 
         params={
