@@ -4,6 +4,7 @@
 import math
 import copy
 import torch
+import numpy as np
 
 from isaaclab.actuators import ImplicitActuatorCfg
 import isaaclab.sim as sim_utils
@@ -18,10 +19,9 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.math import scale_transform, quat_from_euler_xyz, quat_mul, quat_conjugate, quat_rotate
+from isaaclab.utils.math import scale_transform, quat_mul, quat_conjugate
 from isaaclab.sensors import ContactSensorCfg
 
-# Custom MDP modules
 import isaaclab.envs.mdp as mdp
 from .mdp import observations as local_obs 
 from .mdp import rewards as local_rew 
@@ -29,31 +29,82 @@ from .mdp import rewards as local_rew
 from RobotArm.robots.ur10e_w_spindle import UR10E_W_SPINDLE_CFG
 
 # =========================================================================
-# [핵심] ㄹ자 경로 폴리싱 액션 (Operational Space Control)
+# [1] 가상 경로 생성기 (The "Green Line")
 # =========================================================================
-class RasterPolishingAction(ActionTerm):
+class PolishingPathGenerator:
     """
-    [로봇청소기 모드]
-    1. 수학적으로 'ㄹ자(Raster Scan)' 경로를 생성합니다. (경로 파일 대체용)
-    2. Operational Space Control(OSC)을 사용하여 EE가 경로를 따라가게 합니다.
-    3. RL은 이 제어기의 강성(Stiffness)과 감쇠(Damping)를 튜닝합니다.
+    사용자가 언급한 '초록색 선'을 수학적으로 생성합니다.
+    나중에 실제 waypoint 파일이 생기면 이 클래스만 교체하면 됩니다.
+    """
+    def __init__(self, device, num_envs):
+        self.device = device
+        self.num_envs = num_envs
+        
+        # 작업물 표면 기준 (Workpiece Center: 0.75, 0.0, 0.0)
+        # 높이(Z)는 표면(0.05)보다 살짝 아래(0.048)로 설정하여
+        # Stiffness에 의해 자연스럽게 10N이 눌리도록 유도 (Penetration Depth)
+        self.surface_z = 0.05 
+        self.target_z = 0.048 
+        self.center_x = 0.75
+        
+        # 경로 파라미터 (ㄹ자 형태)
+        self.width_y = 0.2   # 좌우 폭
+        self.length_x = 0.15 # 진행 길이
+        self.scan_freq = 2.0 # 좌우 왕복 속도
+
+    def get_target_pose(self, t_scan):
+        """
+        t_scan: Polishing Phase가 시작된 후 흐른 시간
+        return: target_pos (x,y,z), target_quat
+        """
+        # X축: 천천히 전진
+        # Y축: 빠르게 왕복 (Sinewave) -> 이것이 '초록색 선'의 형태
+        path_x = self.center_x - (self.length_x / 2.0) + 0.02 * t_scan 
+        path_y = self.width_y * torch.sin(self.scan_freq * t_scan)
+        path_z = torch.full_like(path_x, self.target_z)
+        
+        target_pos = torch.stack([path_x, path_y, path_z], dim=-1)
+        
+        # Orientation: 무조건 바닥(수직)을 보라.
+        # UR10e Base 기준, EE가 바닥을 보려면 적절한 회전 필요
+        # (여기서는 단순화를 위해 Identity quaternion 가정, 로봇 세팅에 따라 수정 필요)
+        target_quat = torch.tensor([0.0, 1.0, 0.0, 0.0], device=self.device).repeat(self.num_envs, 1)
+        
+        return target_pos, target_quat
+
+    def get_start_pose(self):
+        """ 빨간 점 (Start Point) 위치 반환 """
+        # t=0 일 때의 위치
+        return self.get_target_pose(torch.zeros(self.num_envs, device=self.device))
+
+
+# =========================================================================
+# [2] 통합 폴리싱 액션 (Phase Logic 포함)
+# =========================================================================
+class PolishingMissionAction(ActionTerm):
+    """
+    [미션]
+    1. Start Point(빨간 점)로 이동 (Approach)
+    2. 접촉 후 안정화 (Stabilize)
+    3. 초록색 경로 추종 (Polishing) - 이때 RL이 파라미터(K, D) 최적화
     """
 
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
         self.joint_ids, _ = env.scene.find_joints(cfg.asset_name, cfg.joint_names)
         self.num_joints = len(self.joint_ids)
+        self._action_dim = 12 # (Stiffness 6 + Damping 6)
         
-        # Action Dim: Stiffness(6) + Damping(6) = 12
-        # (XYZ 위치 강성 + RX,RY,RZ 회전 강성 / XYZ 감쇠 + 회전 감쇠)
-        self._action_dim = 12 
+        self.path_gen = PolishingPathGenerator(env.device, env.num_envs)
         
-        # [튜닝] RL이 조절할 물성치 범위
-        # 폴리싱은 위치는 단단하게(High K), 회전은 조금 유연하게, 접촉은 부드럽게(High D)
-        self.stiff_range = torch.tensor([50.0, 1000.0], device=env.device) 
-        self.damp_range = torch.tensor([10.0, 150.0], device=env.device)
+        # 내부 상태 관리
+        self.timer = torch.zeros(env.num_envs, device=env.device)
+        self.phase = torch.zeros(env.num_envs, dtype=torch.int, device=env.device) 
+        # 0: Approach, 1: Stabilize, 2: Polishing
         
-        self.time_idx = torch.zeros(env.num_envs, device=env.device)
+        # 파라미터 범위 (RL이 조절할 범위)
+        self.k_range = torch.tensor([10.0, 2000.0], device=env.device)
+        self.d_range = torch.tensor([5.0, 200.0], device=env.device)
 
     @property
     def action_dim(self) -> int:
@@ -61,93 +112,95 @@ class RasterPolishingAction(ActionTerm):
 
     def process_actions(self, actions: torch.Tensor):
         dt = self._env.step_dt
-        self.time_idx += dt
+        self.timer += dt
         
-        # 1. RL Action -> Impedance Gains (K, D)
-        # actions: (num_envs, 12)
-        # XYZ+Rot Stiffness / XYZ+Rot Damping
-        Kp = scale_transform(actions[:, :6], self.stiff_range[0], self.stiff_range[1])
-        Kd = scale_transform(actions[:, 6:], self.damp_range[0], self.damp_range[1])
-
-        # 2. [ㄹ자 경로 생성] (Raster Scan Path)
-        # "나중에는 경로 파일을 넣겠지만, 지금은 수식으로 만듦"
-        # 중심점: (0.75, 0.0, 0.05)
-        # X축: 천천히 전진 (Velocity = 2cm/s)
-        # Y축: 빠르게 왕복 (Frequency = 0.5Hz, Amplitude = 15cm)
+        # 1. RL Action 해석 (Stiffness, Damping)
+        # RL은 항상 최적의 K, D를 내놓고 있다고 가정
+        kp_val = scale_transform(actions[:, :6], self.k_range[0], self.k_range[1])
+        kd_val = scale_transform(actions[:, 6:], self.d_range[0], self.d_range[1])
         
-        center_x = 0.75
-        center_z = 0.03 # 표면 살짝 위 (3cm) - 누르는 힘은 RL이 K 조절로 결정
+        # 2. Phase 별 목표 위치 설정
+        target_pos_start, target_quat_start = self.path_gen.get_start_pose()
         
-        # X: -0.15 ~ +0.15 범위를 왕복
-        path_x = center_x + 0.15 * torch.sin(0.2 * self.time_idx) 
-        # Y: -0.2 ~ +0.2 범위를 빠르게 왕복 (ㄹ자)
-        path_y = 0.2 * torch.sin(3.0 * self.time_idx)
-        path_z = torch.full_like(path_x, center_z)
-        
-        target_pos = torch.stack([path_x, path_y, path_z], dim=-1)
-
-        # 3. [자세 생성] 무조건 바닥(수직) 보기
-        # UR10e 기준: EE Z축이 World -Z를 봐야 함 (또는 X축 회전 -180도)
-        # Quaternion for looking down (Euler: 180, 0, 0 or similar depending on UR convention)
-        # 여기서는 World Frame 기준 Fixed Orientation
-        target_quat = torch.tensor([0.0, 1.0, 0.0, 0.0], device=self._env.device).repeat(self._env.num_envs, 1) 
-        # (Note: 쿼터니언 값은 로봇의 기본 자세에 따라 [0, 1, 0, 0]이 180도 회전일 수 있음. 확인 필요)
-
-        # 4. 로봇 상태 (Jacobian & EE State)
+        # 로봇 현재 상태
         robot = self._env.scene[self.cfg.asset_name]
-        # Jacobian: (num_envs, 6, num_joints)
-        jacobian = robot.data.jacobian_w[:, self.joint_ids, :] 
-        
         ee_pos = robot.data.body_pos_w[:, -1, :]
         ee_quat = robot.data.body_quat_w[:, -1, :]
-        ee_vel_lin = robot.data.body_vel_w[:, -1, :3]
-        ee_vel_ang = robot.data.body_vel_w[:, -1, 3:]
-
-        # 5. 오차 계산 (Task Space Error)
-        # Position Error
-        pos_error = target_pos - ee_pos
+        jacobian = robot.data.jacobian_w[:, self.joint_ids, :]
         
-        # Orientation Error (Quaternion Difference)
-        # q_err = q_des * q_curr_inv
+        # [Phase Logic]
+        # 간단한 시간 기반 페이즈 전환 (실제로는 센서 접촉 여부로 하면 더 좋음)
+        approach_time = 2.0
+        stabilize_time = 1.0
+        
+        target_pos = torch.zeros_like(ee_pos)
+        target_quat = torch.zeros_like(ee_quat)
+        
+        # Phase 0: Approach (빨간 점 위 1cm에서 빨간 점으로 부드럽게 하강)
+        mask_approach = self.timer < approach_time
+        if torch.any(mask_approach):
+            # approach 중에는 시작점보다 살짝 위 -> 시작점으로 이동
+            ratio = self.timer[mask_approach] / approach_time
+            # 보간: (Start Z + 0.1) -> (Start Z)
+            target_pos[mask_approach] = target_pos_start[mask_approach]
+            target_pos[mask_approach, 2] += 0.05 * (1 - ratio) # 5cm 위에서 내려옴
+            target_quat[mask_approach] = target_quat_start[mask_approach]
+            
+            # 접근 중에는 RL 파라미터 대신 안전한 기본값 사용 (튕김 방지)
+            kp_val[mask_approach] = 500.0
+            kd_val[mask_approach] = 50.0
+
+        # Phase 1: Stabilize (빨간 점에서 정지)
+        mask_stable = (self.timer >= approach_time) & (self.timer < approach_time + stabilize_time)
+        if torch.any(mask_stable):
+            target_pos[mask_stable] = target_pos_start[mask_stable]
+            target_quat[mask_stable] = target_quat_start[mask_stable]
+            # 안정화 중에도 조금 단단하게 잡음
+            kp_val[mask_stable] = 800.0
+            kd_val[mask_stable] = 80.0
+
+        # Phase 2: Polishing (초록색 선 따라가기 - RL이 개입하는 진짜 구간)
+        mask_polish = self.timer >= (approach_time + stabilize_time)
+        if torch.any(mask_polish):
+            # Polishing 시작 후 경과 시간
+            t_polish = self.timer[mask_polish] - (approach_time + stabilize_time)
+            p_pos, p_quat = self.path_gen.get_target_pose(t_polish)
+            target_pos[mask_polish] = p_pos
+            target_quat[mask_polish] = p_quat
+            # 이때는 RL이 출력한 kp_val, kd_val이 그대로 적용됨 (최적화 대상)
+
+        # 3. Operational Space Control (OSC) 토크 계산
+        # Error Calculation
+        pos_err = target_pos - ee_pos
+        
+        # Orientation Error
         quat_inv = quat_conjugate(ee_quat)
         q_diff = quat_mul(target_quat, quat_inv)
-        # Convert to rotation vector (Axis-Angle) approximation
-        # q = [w, x, y, z]. If w~1, angle is small. vec ~= 2*[x,y,z]
-        # (Sign flip check needed for w < 0)
-        sign = torch.sign(q_diff[:, 0]).unsqueeze(1)
-        rot_error = 2.0 * sign * q_diff[:, 1:] # (num_envs, 3)
-
-        # Total Error Vector (6D)
-        error_task = torch.cat([pos_error, rot_error], dim=-1) # (num_envs, 6)
-        velocity_task = torch.cat([ee_vel_lin, ee_vel_ang], dim=-1) # (num_envs, 6)
-
-        # 6. Operational Space Force Calculation
-        # F_task = Kp * Error - Kd * Velocity
-        # (RL이 Kp, Kd를 조절하여 표면을 '얼마나 세게 누를지' 결정)
-        F_task = Kp * error_task - Kd * velocity_task
-
-        # 7. Joint Torque Mapping (Jacobian Transpose)
-        # Tau = J^T * F_task
-        # (num_envs, num_joints, 6) @ (num_envs, 6, 1) -> (num_envs, num_joints)
-        jacobian_T = jacobian.transpose(-2, -1)
-        desired_torque = torch.bmm(jacobian_T, F_task.unsqueeze(-1)).squeeze(-1)
-
-        # 8. 토크 인가
+        rot_err = 2.0 * torch.sign(q_diff[:, 0]).unsqueeze(1) * q_diff[:, 1:]
+        
+        error_task = torch.cat([pos_err, rot_err], dim=-1)
+        vel_task = torch.cat([robot.data.body_vel_w[:, -1, :3], robot.data.body_vel_w[:, -1, 3:]], dim=-1)
+        
+        # F = K * err - D * vel
+        F_task = kp_val * error_task - kd_val * vel_task
+        
+        # Jacobian Transpose to Joint Torque
+        j_t = jacobian.transpose(-2, -1)
+        desired_torque = torch.bmm(j_t, F_task.unsqueeze(-1)).squeeze(-1)
+        
         robot.set_joint_effort_target(desired_torque, joint_ids=self.joint_ids)
 
     def reset(self, env_ids: torch.Tensor | None = None):
         if env_ids is None:
             env_ids = slice(None)
-        self.time_idx[env_ids] = 0.0
+        self.timer[env_ids] = 0.0
 
 
 # =========================================================================
-# Scene & Env Config
+# [3] Scene & Config
 # =========================================================================
 
 USER_STL_PATH = "/home/nrs2/RobotArm2026/flat_surface.stl"
-
-# [수직 자세] 
 DEVICE_READY_STATE = {
     "shoulder_pan_joint": 0.0,
     "shoulder_lift_joint": -1.5708,
@@ -157,26 +210,6 @@ DEVICE_READY_STATE = {
     "wrist_3_joint": 0.0,
 }
 
-# -------------------------------------------------------------------------
-# Scene Configuration
-# -------------------------------------------------------------------------
-TEMP_ROBOT_CFG = copy.deepcopy(UR10E_W_SPINDLE_CFG)
-TEMP_ROBOT_CFG.spawn = sim_utils.UsdFileCfg(
-    usd_path=UR10E_W_SPINDLE_CFG.spawn.usd_path,
-    activate_contact_sensors=True,
-    rigid_props=sim_utils.RigidBodyPropertiesCfg(
-        disable_gravity=False,
-        retain_accelerations=False,
-        linear_damping=0.0,
-        angular_damping=0.0,
-        max_linear_velocity=1000.0,
-        max_angular_velocity=1000.0,
-        max_depenetration_velocity=1.0, 
-        enable_ccd=True, 
-    ),
-    articulation_props=UR10E_W_SPINDLE_CFG.spawn.articulation_props,
-)
-
 @configclass
 class RobotarmSceneCfg(InteractiveSceneCfg):
     ground = AssetBaseCfg(
@@ -184,181 +217,113 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.GroundPlaneCfg(),
         init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0)),
     )
-
     workpiece = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Workpiece",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=USER_STL_PATH,  
-            scale=(1.0, 1.0, 1.0),   
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                kinematic_enabled=True, 
-                disable_gravity=True,
-            ),
-            collision_props=sim_utils.CollisionPropertiesCfg(),
-            physics_material=sim_utils.RigidBodyMaterialCfg(
-                static_friction=1.0,
-                dynamic_friction=1.0,
-                restitution=0.0, 
-            ),
+            usd_path=USER_STL_PATH, scale=(1.0, 1.0, 1.0),   
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True, disable_gravity=True),
         ),
-        init_state=AssetBaseCfg.InitialStateCfg(
-            pos=(0.75, 0.0, 0.0), 
-            rot=(1.0, 0.0, 0.0, 0.0),
-        ),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.75, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0)),
     )
-
-    # [중요] Torque Control Mode
-    robot: ArticulationCfg = TEMP_ROBOT_CFG.replace(
+    # Torque Control Mode (Stiffness=0)
+    robot: ArticulationCfg = UR10E_W_SPINDLE_CFG.replace(
         prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot",
-        init_state=ArticulationCfg.InitialStateCfg(
-            pos=(0.0, 0.0, 0.0), 
-            joint_pos=DEVICE_READY_STATE, 
-        ),
+        init_state=ArticulationCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0), joint_pos=DEVICE_READY_STATE),
         actuators={
             "arm": ImplicitActuatorCfg(
-                joint_names_expr=[".*"],
-                effort_limit=300.0,
-                velocity_limit=100.0,
-                stiffness=0.0,    # Action에서 OSC로 계산하므로 0
-                damping=0.0,      
+                joint_names_expr=[".*"], effort_limit=300.0, velocity_limit=100.0,
+                stiffness=0.0, damping=0.0, # Pure Torque Control
             ),
         }
     )
-
     contact_forces = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot/.*", 
-        history_length=3,
-        track_air_time=False,
+        prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot/.*", history_length=3, track_air_time=False,
     )
-    
     dome_light = AssetBaseCfg(
-        prim_path="/World/Light",
-        spawn=sim_utils.DomeLightCfg(color=(0.9, 0.9, 0.9), intensity=500.0),
+        prim_path="/World/Light", spawn=sim_utils.DomeLightCfg(color=(0.9, 0.9, 0.9), intensity=500.0),
     )
 
 
-# -------------------------------------------------------------------------
-# MDP Settings
-# -------------------------------------------------------------------------
+# =========================================================================
+# [4] MDP - Rewards (The Critic)
+# =========================================================================
 
 @configclass
 class ActionsCfg:
-    # [교체] ㄹ자 경로 + OSC 제어 액션
-    polishing_motion = ActionTerm(
-        func=RasterPolishingAction,
-        params={"asset_name": "robot", "joint_names": [".*"]}
-    )
+    polishing_mission = ActionTerm(func=PolishingMissionAction, params={"asset_name": "robot", "joint_names": [".*"]})
     gripper_action: ActionTerm | None = None
-
 
 @configclass
 class ObservationsCfg:
     @configclass
     class PolicyCfg(ObsGroup):
-        path_tracking = ObsTerm(func=local_obs.path_tracking_obs)
+        # RL이 봐야할 정보: 현재 위치, 힘, 속도, 지난 액션
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel = ObsTerm(func=mdp.joint_vel_rel)
-        ee_history = ObsTerm(func=local_obs.ee_pose_history)
+        force_sensor = ObsTerm(func=local_obs.force_sensor_reading) # (구현 필요 or contact_forces 사용)
+        actions = ObsTerm(func=mdp.last_action)
 
         def __post_init__(self):
             self.enable_corruption = False
             self.concatenate_terms = True
-            
     policy: PolicyCfg = PolicyCfg()
-
 
 @configclass
 class RewardsCfg:
-    # [폴리싱 최적화 보상]
+    # --- 핵심 목표 ---
     
-    # 1. Force Control (최우선)
-    # 10N의 힘으로 지긋이 눌러야 함
-    force_control = RewTerm(func=local_rew.force_control_reward, weight=50.0, params={"target_force": 10.0})
-
-    # 2. Orientation (필수)
-    # 작업 중에 로봇 손목이 꺾이거나 비틀어지면 안 됨 (수직 유지)
-    orientation = RewTerm(func=local_rew.orientation_align_reward, weight=40.0) 
-
-    # 3. Path Tracking
-    # ㄹ자 경로를 잘 따라가는지
-    track_path = RewTerm(func=local_rew.track_path_reward, weight=15.0, params={"sigma": 0.1})
-
-    # 4. Stability
-    # 진동 방지
-    applied_torque = RewTerm(func=mdp.joint_torques_l2, weight=-0.01)
-    joint_vel = RewTerm(func=local_rew.joint_vel_penalty, weight=-0.1)
-    
-    out_of_bounds = RewTerm(func=local_rew.out_of_bounds_penalty, weight=-10.0)
-
-
-@configclass
-class EventCfg:
-    reset_robot_joints = EventTerm(
-        func=mdp.reset_joints_by_offset,
-        mode="reset",
-        params={
-            "position_range": (-0.05, 0.05),
-            "velocity_range": (0.0, 0.0),
-        },
+    # 1. [Force] 10N 유지 (가장 중요)
+    # 10N 근처일 때 점수 높고, 벗어나면 급격히 감점
+    force_tracking = RewTerm(
+        func=local_rew.force_tracking_reward, 
+        weight=100.0, 
+        params={"target_force": 10.0, "tolerance": 1.0}
     )
 
-    randomize_friction = EventTerm(
-        func=mdp.randomize_rigid_body_material,
-        mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-            "static_friction_range": (0.7, 1.3),
-            "dynamic_friction_range": (0.7, 1.3),
-            "restitution_range": (0.0, 0.0),
-        },
+    # 2. [Orientation] 수직 유지 (필수)
+    # Spindle Z축이 World -Z축과 정렬되어야 함
+    orientation_align = RewTerm(
+        func=local_rew.orientation_align_reward, 
+        weight=50.0,
+        params={"target_axis": (0,0,-1)}
     )
+
+    # 3. [Path] 경로 추종 (Contact 상태에서 벗어나지 말 것)
+    # EE가 목표 지점(Green Line)에서 멀어지면 벌점
+    path_tracking = RewTerm(func=local_rew.track_path_reward, weight=20.0, params={"sigma": 0.05})
+
+    # --- 보조 목표 ---
     
-    randomize_mass = EventTerm(
-        func=mdp.randomize_rigid_body_mass,
-        mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-            "mass_distribution_params": (-0.15, 0.15),
-        },
-    )
+    # 4. [Smoothness] 파라미터가 미친듯이 튀지 않도록
+    action_smoothness = RewTerm(func=mdp.action_rate_l2, weight=-0.5)
+    
+    # 5. [Safety] 진동 방지
+    joint_vel_limit = RewTerm(func=mdp.joint_vel_l2, weight=-0.1)
+
+    # 실패 조건 벌점
+    termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
 
 
 @configclass
 class TerminationsCfg:
-    time_out = DoneTerm(func=mdp.time_out, time_out=True)
-    
-    underground_death = DoneTerm(
-        func=mdp.root_height_below_minimum,
-        params={"minimum_height": -0.05, "asset_cfg": SceneEntityCfg("robot")}
-    )
-
-
-@configclass
-class CurriculumCfg:
-    pass
-
+    # 너무 멀리 벗어나거나 뒤집어지면 에피소드 종료
+    episode_timeout = DoneTerm(func=mdp.time_out, time_out=True)
+    bad_orientation = DoneTerm(func=local_rew.bad_orientation_termination, params={"limit_angle": 0.5})
 
 @configclass
 class RobotarmEnvCfg(ManagerBasedRLEnvCfg):
     scene: RobotarmSceneCfg = RobotarmSceneCfg(num_envs=64, env_spacing=2.5)
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
-    events: EventCfg = EventCfg()
-    commands: CommandsCfg = CommandsCfg()
+    events: EventCfg = EventCfg() # (기존 코드 유지)
+    commands: CommandsCfg = CommandsCfg() # (기존 코드 유지)
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
     curriculum: CurriculumCfg = CurriculumCfg()
 
     def __post_init__(self) -> None:
-        self.decimation = 4            
-        self.episode_length_s = 15.0   
-        self.sim.dt = 1.0 / 120.0 
-        
-        self.sim.physx.bounce_threshold_velocity = 0.5 
+        self.decimation = 4
+        self.episode_length_s = 20.0 # 접근+안정화(3초) + 폴리싱(17초)
+        self.sim.dt = 1.0 / 120.0
+        self.sim.physx.bounce_threshold_velocity = 0.2 # 튕김 최소화 설정
         self.sim.physx.enable_stabilization = True
-        self.sim.physx.gpu_max_rigid_contact_count = 1024 * 1024 
-        
-        self.debug_vis = True 
-        
-        self.wp_size_x = 0.5
-        self.wp_size_y = 0.5
