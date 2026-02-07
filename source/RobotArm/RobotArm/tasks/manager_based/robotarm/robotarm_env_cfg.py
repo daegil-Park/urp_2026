@@ -32,9 +32,8 @@ from RobotArm.robots.ur10e_w_spindle import UR10E_W_SPINDLE_CFG
 # =========================================================================
 USER_STL_PATH = "/home/nrs2/RobotArm2026/flat_surface.stl"
 
-
 # -------------------------------------------------------------------------
-# [기본 자세] 논문 1, 3 적용: 초기화 안정성
+# [기본 자세] Ready Pose
 # -------------------------------------------------------------------------
 DEVICE_READY_STATE = {
     "shoulder_pan_joint": 0.0,
@@ -51,7 +50,6 @@ DEVICE_READY_STATE = {
 
 TEMP_ROBOT_CFG = copy.deepcopy(UR10E_W_SPINDLE_CFG)
 
-# [로봇 물리 설정]
 TEMP_ROBOT_CFG.spawn = sim_utils.UsdFileCfg(
     usd_path=UR10E_W_SPINDLE_CFG.spawn.usd_path,
     activate_contact_sensors=True,
@@ -85,8 +83,6 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.UsdFileCfg(
             usd_path=USER_STL_PATH,  
             scale=(1.0, 1.0, 1.0),   
-            
-            # [논문 1,3 적용] 강체 설정 (진동 최소화)
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 kinematic_enabled=True, 
                 disable_gravity=True,
@@ -104,7 +100,9 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    # 3. Robot Actuator Tuning
+    # 3. Robot Actuator Tuning (조교님 조언 반영: Admittance 느낌)
+    # 기존보다 Stiffness를 낮추고(150), Damping을 높여(100) 
+    # 로봇 자체를 '스프링-댐퍼' 시스템처럼 만듭니다. (논문 3의 핵심)
     robot: ArticulationCfg = TEMP_ROBOT_CFG.replace(
         prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot",
         init_state=ArticulationCfg.InitialStateCfg(
@@ -114,10 +112,10 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
         actuators={
             "arm": ImplicitActuatorCfg(
                 joint_names_expr=[".*"],
-                # [논문 3 적용] 고정형 임피던스 제어의 한계 보완
-                # Damping을 충분히 주어(80.0) 급격한 가속(진동)을 하드웨어적으로 막습니다.
-                stiffness=200.0,   
-                damping=80.0,  
+                # [수정] Stiffness 감소 (200 -> 150): 너무 딱딱하면 힘 제어가 안 됨
+                # [수정] Damping 증가 (80 -> 100): 진동을 더 강력하게 억제
+                stiffness=150.0,   
+                damping=100.0,  
             ),
         }
     )
@@ -142,16 +140,21 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
 
 @configclass
 class CommandsCfg:
+    # [조교님 조언: 주어진 경로]
+    # 여기에 '이상적인 경로(Reference Trajectory)'를 정의하는 커맨드를 넣을 수 있습니다.
+    # 지금은 Rewards에서 수학적으로 계산하지만, 추후 여기에 Path Generator를 붙일 수 있습니다.
     pass
 
 @configclass
 class ActionsCfg:
-    # [논문 3 적용] 정밀한 힘 제어를 위한 Scaling
-    # 논문에서는 미세한 조정이 힘 제어의 핵심이라고 합니다.
+    # [조교님 조언: 세부 파라미터 개선]
+    # Action Scale을 극도로 줄여서(0.001), RL이 '경로 생성'을 하는 게 아니라
+    # '경로 오차 보정(Fine-tuning)'만 수행하도록 제한합니다.
+    # 이것이 사실상 "Admittance Control"의 RL 버전입니다. (Force -> Position Offset)
     arm_action: ActionTerm = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=[".*"],
-        scale=0.005, # 0.005 유지 (정밀 제어)
+        scale=0.001, # [핵심 변경] 매우 작게 설정
         use_default=True, 
     )
     gripper_action: ActionTerm | None = None
@@ -161,10 +164,13 @@ class ActionsCfg:
 class ObservationsCfg:
     @configclass
     class PolicyCfg(ObsGroup):
-        # [논문 1 적용] POMDP 해결 (History + Velocity)
+        # [논문 1, 3 적용] 상태 관측
         path_tracking = ObsTerm(func=local_obs.path_tracking_obs)
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+        
+        # [중요] 힘 제어를 하려면 '과거의 힘 데이터'를 아는 것이 필수입니다.
+        # History에 힘 센서 값도 포함되면 좋지만, 일단 EE Pose History로 간접 추정합니다.
         ee_history = ObsTerm(func=local_obs.ee_pose_history)
 
         def __post_init__(self):
@@ -176,33 +182,38 @@ class ObservationsCfg:
 
 @configclass
 class RewardsCfg:
-    # [논문 아이디어 통합: Reward Shaping]
+    # [조교님 조언 + 논문 3: Reward 구조 변경]
+    # "경로를 따라가라"는 이미 쉬운 문제이므로 가중치를 낮춥니다.
+    # "힘을 맞춰라(Force Control)"와 "진동하지 마라(Stability)"에 집중합니다.
     
-    # 1. Main Task (경로 추종 + 자세 유지)
-    track_path = RewTerm(func=local_rew.track_path_reward, weight=15.0, params={"sigma": 0.1})
-    orientation = RewTerm(func=local_rew.orientation_align_reward, weight=30.0) 
-    
-    # 2. Force Control (접촉 유지)
-    force_control = RewTerm(func=local_rew.force_control_reward, weight=3.0, params={"target_force": 10.0})
-    approach = RewTerm(func=local_rew.surface_approach_reward, weight=5.0, params={"target_height": 0.03})
+    # 1. Force Control (최우선 목표)
+    # 목표 힘(10N)을 맞추면 점수를 가장 크게 줍니다.
+    force_control = RewTerm(func=local_rew.force_control_reward, weight=50.0, params={"target_force": 10.0})
 
-    # 3. Penalties (안정성 강화)
+    # 2. Path Tracking (기본 목표)
+    # 경로에서 이탈하지 않는지 체크 (가중치 15 -> 10 하향)
+    track_path = RewTerm(func=local_rew.track_path_reward, weight=10.0, params={"sigma": 0.1})
+    
+    # 3. Orientation (자세 유지)
+    orientation = RewTerm(func=local_rew.orientation_align_reward, weight=20.0) 
+    
+    # 4. Stability (진동 억제)
+    # [논문 3 적용] 에너지(Torque) 최소화 = 부드러운 움직임
+    applied_torque = RewTerm(func=mdp.joint_torques_l2, weight=-0.01)
+    
+    # 급격한 행동 변화(Jerk) 방지
+    smoothness = RewTerm(func=local_rew.action_smoothness_penalty, weight=-0.1)
+    
+    # 속도 제한 (천천히 작업)
     joint_vel = RewTerm(func=local_rew.joint_vel_penalty, weight=-0.1)
+
+    # 5. Fail Cases
     out_of_bounds = RewTerm(func=local_rew.out_of_bounds_penalty, weight=-5.0)
-    
-    # [논문 3 적용: 에너지 효율성]
-    # 과도한 토크 사용은 곧 진동과 불안정성을 의미합니다.
-    # 로봇이 힘을 '억지로' 쓰지 않고 부드럽게 움직이도록 유도합니다.
-    applied_torque = RewTerm(func=mdp.joint_torques_l2, weight=-0.005) # [신규 추가]
-    
-    # [논문 3 적용: Action Smoothness 강화]
-    # 가중치를 -0.05 -> -0.1로 높여서 이전 행동과 급격히 다른 행동을 강력히 규제합니다.
-    smoothness = RewTerm(func=local_rew.action_smoothness_penalty, weight=-0.1) # [가중치 상향]
 
 
 @configclass
 class EventCfg:
-    # 1. 초기화 전략
+    # [논문 1 적용] Sim-to-Real Robustness
     reset_robot_joints = EventTerm(
         func=mdp.reset_joints_by_offset,
         mode="reset",
@@ -212,7 +223,7 @@ class EventCfg:
         },
     )
 
-    # [논문 1 적용] 도메인 랜덤화 (Sim-to-Real)
+    # 물리 파라미터 랜덤화 (필수)
     randomize_friction = EventTerm(
         func=mdp.randomize_rigid_body_material,
         mode="reset",
@@ -223,7 +234,8 @@ class EventCfg:
             "restitution_range": (0.0, 0.0),
         },
     )
-
+    
+    # 질량 랜덤화 (어드미턴스 제어의 M 파라미터 대응 훈련)
     randomize_mass = EventTerm(
         func=mdp.randomize_rigid_body_mass,
         mode="reset",
@@ -238,20 +250,10 @@ class EventCfg:
 class TerminationsCfg:
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
     
-    # 1. 위치 안전장치 (지하 관통 방지)
     underground_death = DoneTerm(
         func=mdp.root_height_below_minimum,
         params={"minimum_height": -0.05, "asset_cfg": SceneEntityCfg("robot")}
     )
-    
-    # [논문 3 적용: 힘 안전장치 (Safety Constraint)]
-    # 논문에서는 안전을 위해 일정 힘 이상이 걸리면 제어를 중단합니다.
-    # 여기서는 학습 중 '실패'로 처리하여 로봇이 과도한 충돌을 피하게 합니다.
-    # (참고: local_rew에 해당 함수가 없으면 mdp 함수를 쓰거나 생략 가능하지만, 효과가 매우 큽니다)
-    # force_limit = DoneTerm(
-    #     func=mdp.contact_force_above_threshold, # Isaac Lab 기본 함수 확인 필요
-    #     params={"threshold": 50.0, "sensor_cfg": SceneEntityCfg("contact_forces")}
-    # )
 
 
 @configclass
@@ -276,12 +278,11 @@ class RobotarmEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.dt = 1.0 / 120.0 
         self.sim.render_interval = self.decimation
         
-        # [PhysX 설정] 물리 안정성
+        # [안정성 설정]
         self.sim.physx.bounce_threshold_velocity = 0.5 
         self.sim.physx.enable_stabilization = True
         self.sim.physx.gpu_max_rigid_contact_count = 1024 * 1024 
         
-        # [논문 2 적용] 시각적 가이드
         self.debug_vis = True 
         
         self.wp_size_x = 0.5
