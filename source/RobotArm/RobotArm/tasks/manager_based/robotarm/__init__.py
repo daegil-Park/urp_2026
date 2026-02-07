@@ -11,9 +11,8 @@ from . import agents
 # Register Gym environments.
 ##
 
-# [수정됨] id를 "RobotArm-v0"로 변경하여 train.py가 이 설정을 바라보게 함!
 gym.register(
-    id="RobotArm-v0",  # <--- 원래 "Template-Robotarm-v0" 였던 것을 수정!
+    id="Template-Robotarm-v0",  # <--- 원래대로 복구 완료
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
