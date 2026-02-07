@@ -6,6 +6,9 @@ import copy
 import torch
 import numpy as np
 
+# [시각화 도구 Import]
+from omni.isaac.debug_draw import _debug_draw 
+
 from isaaclab.actuators import ImplicitActuatorCfg
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
@@ -29,7 +32,7 @@ from .mdp import rewards as local_rew
 from RobotArm.robots.ur10e_w_spindle import UR10E_W_SPINDLE_CFG
 
 # =========================================================================
-# [Action] 디버깅 로그가 포함된 하이브리드 액션 (이름 문제 해결)
+# [Action] 자석 모드 + 수직 하강 + 시각화(Green Line) 통합 액션
 # =========================================================================
 class HybridPolishingAction(ActionTerm):
     def __init__(self, cfg, env):
@@ -44,16 +47,18 @@ class HybridPolishingAction(ActionTerm):
         self.path_timer = torch.zeros(env.num_envs, device=env.device)
         self.contact_z = torch.zeros(env.num_envs, device=env.device)
 
-        # RL 파라미터 범위
+        # RL Parameter Ranges
         self.k_pos_range = torch.tensor([10.0, 1500.0], device=env.device)
         self.k_rot_range = torch.tensor([100.0, 1000.0], device=env.device) 
         self.d_range = torch.tensor([10.0, 150.0], device=env.device)
 
-        # 작업 중심점 (Green Box Center)
+        # Workpiece Center
         self.center_x = 0.75
         self.center_y = 0.0
         
-        # [DEBUG] 실행 확인용 플래그
+        # [Visual] 디버그 그리기 도구 초기화
+        self.draw = _debug_draw.acquire_debug_draw_interface()
+        self.prev_pos_vis = None 
         self.debug_printed = False
 
     @property
@@ -61,10 +66,11 @@ class HybridPolishingAction(ActionTerm):
         return self._action_dim
 
     def process_actions(self, actions: torch.Tensor):
-        # [DEBUG] 이 로그가 터미널에 안 뜨면 파일 경로가 잘못된 것입니다.
+        # 1. 터미널 로그 출력 (최초 1회)
         if not self.debug_printed:
             print("\n" + "="*60)
             print("🚀 [HybridPolishingAction] ACTION LOADED SUCCESSFULLY!")
+            print("🎨 [Visual] Green Line Drawing Enabled on Env 0")
             print("   Mode: Align -> Vertical Descend -> Magnet Polish")
             print("="*60 + "\n")
             self.debug_printed = True
@@ -72,18 +78,32 @@ class HybridPolishingAction(ActionTerm):
         dt = self._env.step_dt
         self.timer += dt
         
-        # 1. Robot & Sensor State
+        # Robot State
         robot = self._env.scene[self.cfg.asset_name]
         ee_pos = robot.data.body_pos_w[:, -1, :]   
         ee_quat = robot.data.body_quat_w[:, -1, :] 
         
+        # ----------------------------------------------------------------
+        # [Visual] 초록색 궤적 그리기 (0번 환경만)
+        # ----------------------------------------------------------------
+        # 현재 0번 로봇의 위치
+        curr_pos_vis = ee_pos[0].cpu().numpy().tolist()
+        
+        if self.prev_pos_vis is not None:
+            self.draw.draw_lines(
+                [self.prev_pos_vis, curr_pos_vis], # Start -> End
+                [(0.0, 1.0, 0.0, 1.0)],            # Green Color
+                [3.0]                              # Thickness
+            )
+        self.prev_pos_vis = curr_pos_vis
+        # ----------------------------------------------------------------
+
         sensor = self._env.scene.sensors["contact_forces"]
-        # Z축 힘 (절댓값)
         force_z = torch.abs(sensor.data.net_forces_w[..., 2]).max(dim=-1)[0]
 
-        # 2. Target Init (수직 쿼터니언 고정)
+        # Target Init
         target_pos = ee_pos.clone()
-        # [0, 1, 0, 0]이 UR10e Base 기준 바닥을 보는 자세 (사용자 환경에 맞게 조정 가능)
+        # [중요] 수직 자세 고정 (UR10e Base 기준 바닥보기: [0, 1, 0, 0] 가정)
         target_quat = torch.tensor([0.0, 1.0, 0.0, 0.0], device=self._env.device).repeat(self._env.num_envs, 1)
 
         # RL Params Decoding
@@ -92,11 +112,10 @@ class HybridPolishingAction(ActionTerm):
         d_pos = scale_transform(actions[:, 6:9], self.d_range[0], self.d_range[1])
         d_rot = scale_transform(actions[:, 9:12], self.d_range[0], self.d_range[1])
 
-        # 자석 바이어스 힘 (기본 0)
         F_bias = torch.zeros_like(ee_pos)
 
         # ------------------------------------------------------------------
-        # State 0: Align (상공 20cm 정렬 & 대기)
+        # State 0: Align (상공 20cm 정지)
         # ------------------------------------------------------------------
         mask_align = (self.state == 0)
         if torch.any(mask_align):
@@ -104,12 +123,10 @@ class HybridPolishingAction(ActionTerm):
             target_pos[mask_align, 1] = self.center_y
             target_pos[mask_align, 2] = 0.20 
             
-            # 아주 단단하게 고정
             k_pos[mask_align] = 2000.0
             k_rot[mask_align] = 2000.0 
             d_pos[mask_align] = 100.0
 
-            # 오차 확인 (안정화)
             err = torch.norm(target_pos[mask_align] - ee_pos[mask_align], dim=-1)
             ready = (self.timer > 2.0) & (err < 0.02)
             
@@ -123,10 +140,9 @@ class HybridPolishingAction(ActionTerm):
         # ------------------------------------------------------------------
         mask_descend = (self.state == 1)
         if torch.any(mask_descend):
-            # XY 절대 고정
             target_pos[mask_descend, 0] = self.center_x
             target_pos[mask_descend, 1] = self.center_y
-            # Z만 0.5mm씩 하강
+            # 0.5mm씩 천천히 하강
             target_pos[mask_descend, 2] = ee_pos[mask_descend, 2] - 0.0005
             
             k_pos[mask_descend] = 1000.0
@@ -150,10 +166,10 @@ class HybridPolishingAction(ActionTerm):
             self.path_timer[mask_polish] += dt
             t = self.path_timer[mask_polish]
             
-            # [자석 1] 목표: 지하 2cm (물리엔진이 막아줌 -> 압착)
+            # [자석 1] 목표: 지하 2cm (압착 유도)
             target_z = self.contact_z[mask_polish] - 0.02
             
-            # [자석 2] ㄹ자 경로
+            # [자석 2] ㄹ자 경로 (Raster Scan)
             path_x = self.center_x + 0.15 * torch.sin(0.2 * t)
             path_y = 0.2 * torch.sin(3.0 * t)
             
@@ -161,13 +177,13 @@ class HybridPolishingAction(ActionTerm):
             target_pos[mask_polish, 1] = path_y
             target_pos[mask_polish, 2] = target_z
             
-            # [자석 3] 회전 강성 최소값 보장
+            # [자석 3] 회전 강성 최소값 보장 (비틀림 방지)
             k_rot[mask_polish] = torch.clamp(k_rot[mask_polish], min=500.0)
             
-            # [자석 4] Bias Force (-20N) -> 인공 중력 추가
+            # [자석 4] Bias Force (-20N) -> 인공 중력
             F_bias[mask_polish, 2] = -20.0 
 
-        # 3. OSC Calculation
+        # OSC Calculation
         pos_err = target_pos - ee_pos
         quat_inv = quat_conjugate(ee_quat)
         q_diff = quat_mul(target_quat, quat_inv)
@@ -194,6 +210,9 @@ class HybridPolishingAction(ActionTerm):
         self.state[env_ids] = 0
         self.timer[env_ids] = 0.0
         self.path_timer[env_ids] = 0.0
+        # 리셋 시 시각화 끊기 (0번 환경)
+        if 0 in env_ids:
+            self.prev_pos_vis = None
 
 
 # =========================================================================
@@ -213,7 +232,7 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
         init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0)),
     )
     
-    # [Box] 단단한 바닥
+    # [Box] 단단한 초록색 바닥 (STL 대체)
     workpiece = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Workpiece",
         spawn=sim_utils.CuboidCfg(
@@ -258,7 +277,7 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
 # =========================================================================
 @configclass
 class ActionsCfg:
-    # [CRITICAL] 이름을 'arm_action'으로 하여 시스템이 무조건 읽게 함
+    # [CRITICAL] 이름을 'arm_action'으로 유지 (중요)
     arm_action = ActionTerm(
         func=HybridPolishingAction, 
         params={"asset_name": "robot", "joint_names": [".*"]}
@@ -313,6 +332,7 @@ class RobotarmEnvCfg(ManagerBasedRLEnvCfg):
         self.decimation = 4
         self.episode_length_s = 20.0
         self.sim.dt = 1.0 / 120.0
+        # 물리 안정화 (Substeps)
         self.sim.substeps = 2
         self.sim.physx.bounce_threshold_velocity = 0.5
         self.sim.physx.enable_stabilization = True
