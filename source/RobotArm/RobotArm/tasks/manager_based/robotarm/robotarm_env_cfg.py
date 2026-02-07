@@ -1,63 +1,31 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers
-# SPDX-License-Identifier: BSD-3-Clause
-
-import math
-import copy
-import torch
-
-from isaaclab.actuators import ImplicitActuatorCfg
-import isaaclab.sim as sim_utils
-from isaaclab.assets import ArticulationCfg, AssetBaseCfg
-from isaaclab.envs import ManagerBasedRLEnvCfg
-from isaaclab.managers import ActionTermCfg as ActionTerm
-from isaaclab.managers import EventTermCfg as EventTerm
-from isaaclab.managers import ObservationGroupCfg as ObsGroup
-from isaaclab.managers import ObservationTermCfg as ObsTerm
-from isaaclab.managers import RewardTermCfg as RewTerm
-from isaaclab.managers import SceneEntityCfg
-from isaaclab.managers import TerminationTermCfg as DoneTerm
-from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.utils import configclass
-from isaaclab.utils.math import scale_transform, quat_mul, quat_conjugate
-from isaaclab.sensors import ContactSensorCfg
-
-import isaaclab.envs.mdp as mdp
-from .mdp import observations as local_obs 
-from .mdp import rewards as local_rew 
-
-from RobotArm.robots.ur10e_w_spindle import UR10E_W_SPINDLE_CFG
+# ... (이전 import 문들은 그대로 유지) ...
 
 # =========================================================================
-# [핵심] 하이브리드 액션 (Rule-based Init + RL Optimization)
+# [Action] 수직 하강 (Drill Press Style) & 하이브리드 제어
 # =========================================================================
 class HybridPolishingAction(ActionTerm):
-    """
-    [사용자 요청 반영] JacobianController.py 로직 이식
-    
-    State 0 (Approach): 시작점 상공에서 수직 자세 정렬 (High Stiffness)
-    State 1 (Landing): 아주 천천히 하강하며 접촉 감지 (Soft Landing)
-    State 2 (RL Polishing): 접촉 후 RL 파라미터로 ㄹ자 경로 추종
-    """
-
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
         self.joint_ids, _ = env.scene.find_joints(cfg.asset_name, cfg.joint_names)
         self.num_joints = len(self.joint_ids)
-        self._action_dim = 12 # RL Output: Pos_K(3), Rot_K(3), Pos_D(3), Rot_D(3)
+        self._action_dim = 12 
         
-        # 내부 상태 변수
+        # State Machine
+        # 0: Align (상공에서 위치 잡기)
+        # 1: Descend (수직으로만 내려가기)
+        # 2: Polishing (RL 개입 시작)
         self.state = torch.zeros(env.num_envs, dtype=torch.int, device=env.device) 
-        # 0: Approach, 1: Landing, 2: Polishing
         self.timer = torch.zeros(env.num_envs, device=env.device)
-        self.contact_z = torch.zeros(env.num_envs, device=env.device) # 접촉 지점 높이 저장
+        self.contact_z = torch.zeros(env.num_envs, device=env.device)
 
-        # [튜닝] RL 파라미터 범위
+        # RL 파라미터 범위
         self.k_pos_range = torch.tensor([10.0, 1500.0], device=env.device)
-        self.k_rot_range = torch.tensor([100.0, 1000.0], device=env.device) # 회전은 기본적으로 단단하게
+        self.k_rot_range = torch.tensor([100.0, 1000.0], device=env.device) 
         self.d_range = torch.tensor([10.0, 150.0], device=env.device)
 
-        # 경로 생성용 변수
+        # 작업 중심점
         self.center_x = 0.75
+        self.center_y = 0.0
         self.path_timer = torch.zeros(env.num_envs, device=env.device)
 
     @property
@@ -68,117 +36,116 @@ class HybridPolishingAction(ActionTerm):
         dt = self._env.step_dt
         self.timer += dt
         
-        # --- 1. 센서 데이터 및 로봇 상태 ---
+        # 1. 로봇 상태 가져오기
         robot = self._env.scene[self.cfg.asset_name]
-        ee_pos = robot.data.body_pos_w[:, -1, :]
-        ee_quat = robot.data.body_quat_w[:, -1, :]
-        jacobian = robot.data.jacobian_w[:, self.joint_ids, :]
+        ee_pos = robot.data.body_pos_w[:, -1, :]   # [num_envs, 3]
+        ee_quat = robot.data.body_quat_w[:, -1, :] # [num_envs, 4]
         
-        # 힘 센서 (Z축 힘) 가져오기
+        # 접촉 센서 (Z축 힘)
         sensor = self._env.scene.sensors["contact_forces"]
-        force_z = torch.abs(sensor.data.net_forces_w[..., 2]).max(dim=-1)[0] # (num_envs,)
+        force_z = torch.abs(sensor.data.net_forces_w[..., 2]).max(dim=-1)[0]
 
-        # --- 2. State Machine (보내주신 코드 로직 구현) ---
-        
-        # 목표값 초기화
+        # 2. 목표값 초기화
         target_pos = ee_pos.clone()
-        target_quat = torch.tensor([0.0, 1.0, 0.0, 0.0], device=self._env.device).repeat(self._env.num_envs, 1) # 수직(바닥)
+        # [핵심] 무조건 바닥을 보는 수직 쿼터니언 고정 (변하지 않음)
+        # (UR10e 기준: Rotate X 180 deg -> [0, 1, 0, 0])
+        target_quat = torch.tensor([0.0, 1.0, 0.0, 0.0], device=self._env.device).repeat(self._env.num_envs, 1)
 
-        # RL 파라미터 디코딩 (기본값)
+        # RL 파라미터 디코딩
         k_pos = scale_transform(actions[:, 0:3], self.k_pos_range[0], self.k_pos_range[1])
         k_rot = scale_transform(actions[:, 3:6], self.k_rot_range[0], self.k_rot_range[1])
         d_pos = scale_transform(actions[:, 6:9], self.d_range[0], self.d_range[1])
         d_rot = scale_transform(actions[:, 9:12], self.d_range[0], self.d_range[1])
 
-        # [State 0] Approach (상공 이동 & 자세 정렬)
-        mask_approach = (self.state == 0)
-        if torch.any(mask_approach):
-            # 목표: (0.75, 0.0, 0.15) -> 상공 15cm
-            target_pos[mask_approach, 0] = self.center_x
-            target_pos[mask_approach, 1] = 0.0
-            target_pos[mask_approach, 2] = 0.15 
+        # ==================================================================
+        # [State 0] Align: 상공 정렬 (XY 이동, Z 고정)
+        # ==================================================================
+        mask_align = (self.state == 0)
+        if torch.any(mask_align):
+            # 목표: 작업점 상공 20cm
+            target_pos[mask_align, 0] = self.center_x
+            target_pos[mask_align, 1] = self.center_y
+            target_pos[mask_align, 2] = 0.20 
             
-            # 2초 지나면 다음 단계로
-            # 강성은 매우 단단하게 (자세 잡기 위해)
-            k_pos[mask_approach] = 2000.0
-            k_rot[mask_approach] = 1000.0 # [중요] 수직 자세 꽉 잡기
-            d_pos[mask_approach] = 100.0
-            
-            # 거리 오차가 작으면 다음 스테이지
-            dist_err = torch.norm(target_pos[mask_approach] - ee_pos[mask_approach], dim=-1)
-            ready_envs = (self.timer > 2.0) & (dist_err < 0.01)
-            # mask_approach 중 ready_envs인 것들의 state를 1로 변경
-            # (인덱싱 주의: 전체 인덱스에서 mask_approach가 True인 것 중 ready가 True인 것)
-            switch_ids = torch.nonzero(mask_approach).flatten()[ready_envs]
-            self.state[switch_ids] = 1
-            self.timer[switch_ids] = 0.0 # 타이머 리셋
+            # 강성 최대 (빠르고 정확하게 이동)
+            k_pos[mask_align] = 2000.0
+            k_rot[mask_align] = 1000.0 
+            d_pos[mask_align] = 100.0
 
-        # [State 1] Landing (천천히 하강)
-        mask_landing = (self.state == 1)
-        if torch.any(mask_landing):
-            # XY는 고정, Z만 아주 천천히 내림
-            target_pos[mask_landing, 0] = self.center_x
-            target_pos[mask_landing, 1] = 0.0
-            # 현재 위치보다 0.2mm 아래를 목표로 (속도 제어 효과)
-            target_pos[mask_landing, 2] = ee_pos[mask_landing, 2] - 0.0005 
+            # XY 위치가 맞고, 높이도 얼추 맞으면 다음 단계로
+            err = torch.norm(target_pos[mask_align] - ee_pos[mask_align], dim=-1)
+            ready = (self.timer > 1.5) & (err < 0.02)
             
-            # 강성은 중간 정도 (충격 흡수)
-            k_pos[mask_landing] = 800.0
-            k_rot[mask_landing] = 1000.0 # 수직은 계속 유지
+            switch_ids = torch.nonzero(mask_align).flatten()[ready]
+            self.state[switch_ids] = 1
+            self.timer[switch_ids] = 0.0
+        
+        # ==================================================================
+        # [State 1] Descend: 수직 하강 (XY 고정, Z 감소)
+        # ==================================================================
+        mask_descend = (self.state == 1)
+        if torch.any(mask_descend):
+            # [핵심] XY는 절대 움직이지 않음 (수직 유지)
+            target_pos[mask_descend, 0] = self.center_x
+            target_pos[mask_descend, 1] = self.center_y
             
-            # 접촉 감지 (2N 이상)
+            # Z축만 현재 위치보다 아주 조금 아래로 설정 (속도 제어 효과)
+            # 0.5mm 씩 내림 -> 부드러운 하강
+            target_pos[mask_descend, 2] = ee_pos[mask_descend, 2] - 0.0005
+            
+            # 강성 조절 (충격 흡수 대비)
+            k_pos[mask_descend] = 800.0
+            k_rot[mask_descend] = 1000.0 # 회전은 여전히 꽉 잡음 (기울어짐 방지)
+            
+            # 접촉 감지 (2N 이상 닿으면 멈춤)
             contacted = (force_z > 2.0)
-            switch_ids = torch.nonzero(mask_landing).flatten()[contacted[mask_landing]]
+            switch_ids = torch.nonzero(mask_descend).flatten()[contacted[mask_descend]]
             
             if len(switch_ids) > 0:
                 self.state[switch_ids] = 2
-                self.contact_z[switch_ids] = ee_pos[switch_ids, 2] # 바닥 높이 기억
+                self.contact_z[switch_ids] = ee_pos[switch_ids, 2] # 닿은 높이 저장
                 self.timer[switch_ids] = 0.0
                 self.path_timer[switch_ids] = 0.0
-                # 디버그 출력 대신 로봇이 멈칫하는 걸로 알 수 있음
 
-        # [State 2] Polishing (RL Control + ㄹ자 경로)
-        mask_polishing = (self.state == 2)
-        if torch.any(mask_polishing):
-            self.path_timer[mask_polishing] += dt
-            t = self.path_timer[mask_polishing]
+        # ==================================================================
+        # [State 2] Polishing: 작업 시작 (RL + ㄹ자 패턴)
+        # ==================================================================
+        mask_polish = (self.state == 2)
+        if torch.any(mask_polish):
+            self.path_timer[mask_polish] += dt
+            t = self.path_timer[mask_polish]
             
-            # ㄹ자 경로 생성 (초록색 선)
-            # Z값: 기억해둔 바닥 높이(contact_z)보다 2mm 아래 (10N 가압 유도)
-            target_z = self.contact_z[mask_polishing] - 0.002 
+            # 저장된 바닥 높이(contact_z)보다 2mm 더 누름 (10N 생성)
+            target_z = self.contact_z[mask_polish] - 0.002
             
+            # 이제서야 비로소 XY가 움직임 (ㄹ자 패턴)
             path_x = self.center_x + 0.15 * torch.sin(0.2 * t)
             path_y = 0.2 * torch.sin(3.0 * t)
             
-            target_pos[mask_polishing, 0] = path_x
-            target_pos[mask_polishing, 1] = path_y
-            target_pos[mask_polishing, 2] = target_z
+            target_pos[mask_polish, 0] = path_x
+            target_pos[mask_polish, 1] = path_y
+            target_pos[mask_polish, 2] = target_z
             
-            # 이때는 RL이 출력한 k_pos, k_rot 등이 그대로 적용됨 (최적화 대상)
-            # 단, 수직 유지를 위해 k_rot 최소값은 보장
-            k_rot[mask_polishing] = torch.clamp(k_rot[mask_polishing], min=300.0)
+            # RL이 출력한 강성 적용 (단, 회전 강성 최소값은 보장)
+            k_rot[mask_polish] = torch.clamp(k_rot[mask_polish], min=300.0)
 
-        # --- 3. Operational Space Control (OSC) 토크 계산 ---
-        # Position Error
+
+        # 3. 토크 계산 (OSC)
         pos_err = target_pos - ee_pos
         
-        # Orientation Error (Quaternion diff)
         quat_inv = quat_conjugate(ee_quat)
         q_diff = quat_mul(target_quat, quat_inv)
-        # q_diff의 x,y,z 성분이 회전 오차 축
         rot_err = 2.0 * torch.sign(q_diff[:, 0]).unsqueeze(1) * q_diff[:, 1:]
         
-        # Velocity
         vel_lin = robot.data.body_vel_w[:, -1, :3]
         vel_ang = robot.data.body_vel_w[:, -1, 3:]
         
-        # Force Command = K*err - D*vel
         F_pos = k_pos * pos_err - d_pos * vel_lin
         F_rot = k_rot * rot_err - d_rot * vel_ang
         
         F_task = torch.cat([F_pos, F_rot], dim=-1)
         
-        # Jacobian Transpose Mapping (Task Force -> Joint Torque)
+        jacobian = robot.data.jacobian_w[:, self.joint_ids, :]
         j_t = jacobian.transpose(-2, -1)
         desired_torque = torch.bmm(j_t, F_task.unsqueeze(-1)).squeeze(-1)
         
@@ -187,10 +154,9 @@ class HybridPolishingAction(ActionTerm):
     def reset(self, env_ids: torch.Tensor | None = None):
         if env_ids is None:
             env_ids = slice(None)
-        self.state[env_ids] = 0 # 리셋 시 Approach 부터 다시 시작
+        self.state[env_ids] = 0
         self.timer[env_ids] = 0.0
         self.path_timer[env_ids] = 0.0
-
 
 # =========================================================================
 # Scene Config (물리 안정성 최우선)
