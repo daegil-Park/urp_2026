@@ -10,7 +10,8 @@ from isaaclab.actuators import ImplicitActuatorCfg
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
-from isaaclab.managers import ActionTermCfg as ActionTerm
+# [수정 1] ActionTerm(구현용)과 ActionTermCfg(설정용) 분리 import
+from isaaclab.managers import ActionTerm, ActionTermCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -23,16 +24,18 @@ from isaaclab.utils.math import scale_transform, quat_mul, quat_conjugate
 from isaaclab.sensors import ContactSensorCfg
 
 import isaaclab.envs.mdp as mdp
+# (주의) 아래 local_obs, local_rew 파일이 실제로 존재하는지 확인해주세요.
+# 만약 없으면 이 줄에서 에러가 날 수 있습니다.
 from .mdp import observations as local_obs 
 from .mdp import rewards as local_rew 
 
 from RobotArm.robots.ur10e_w_spindle import UR10E_W_SPINDLE_CFG
 
 # =========================================================================
-# [Action] 디버깅 로그가 포함된 하이브리드 액션 (이름 문제 해결)
+# [Action] 커스텀 액션 클래스 (ActionTerm 상속)
 # =========================================================================
 class HybridPolishingAction(ActionTerm):
-    def __init__(self, cfg, env):
+    def __init__(self, cfg: ActionTermCfg, env):
         super().__init__(cfg, env)
         self.joint_ids, _ = env.scene.find_joints(cfg.asset_name, cfg.joint_names)
         self.num_joints = len(self.joint_ids)
@@ -258,12 +261,13 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
 # =========================================================================
 @configclass
 class ActionsCfg:
-    # [CRITICAL] 이름을 'arm_action'으로 하여 시스템이 무조건 읽게 함
-    arm_action = ActionTerm(
-        func=HybridPolishingAction, 
-        params={"asset_name": "robot", "joint_names": [".*"]}
+    # [수정 2] class_type으로 클래스 연결하고, 인자를 밖으로 뺌
+    arm_action = ActionTermCfg(
+        class_type=HybridPolishingAction, 
+        asset_name="robot", 
+        joint_names=[".*"]
     )
-    gripper_action: ActionTerm | None = None
+    gripper_action: ActionTermCfg | None = None
 
 @configclass
 class ObservationsCfg:
@@ -297,6 +301,15 @@ class EventCfg:
         func=mdp.reset_joints_by_offset, mode="reset",
         params={"position_range": (-0.02, 0.02), "velocity_range": (0.0, 0.0)}
     )
+
+# [수정 3] 아래 두 클래스가 정의되어 있지 않아 추가했습니다. (빈 설정)
+@configclass
+class CommandsCfg:
+    null = mdp.NullCommandCfg()
+
+@configclass
+class CurriculumCfg:
+    pass
 
 @configclass
 class RobotarmEnvCfg(ManagerBasedRLEnvCfg):
