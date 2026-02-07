@@ -37,11 +37,11 @@ USER_STL_PATH = "/home/nrs2/RobotArm2026/flat_surface.stl"
 # [수직 자세] 기본 자세 (논문 아이디어: 초기화 전략)
 # -------------------------------------------------------------------------
 # 로봇이 시작할 때부터 '작업 준비 자세(Ready Pose)'를 취하게 하여
-# 불필요한 탐색(허공 휘젓기)을 줄입니다.
+# 불필요한 탐색 시간을 줄이고, 초기 충돌을 방지합니다.
 DEVICE_READY_STATE = {
     "shoulder_pan_joint": 0.0,
-    "shoulder_lift_joint": -1.5708, # -90도
-    "elbow_joint": -1.5708,         # -90도
+    "shoulder_lift_joint": -1.5708, # -90도 (팔을 세움)
+    "elbow_joint": -1.5708,         # -90도 (앞으로 굽힘)
     "wrist_1_joint": -1.5708,       # -90도 (손목을 아래로)
     "wrist_2_joint": 1.5708,        # +90도 (툴 정렬)
     "wrist_3_joint": 0.0,
@@ -65,7 +65,7 @@ TEMP_ROBOT_CFG.spawn = sim_utils.UsdFileCfg(
         max_linear_velocity=1000.0,
         max_angular_velocity=1000.0,
         max_depenetration_velocity=1.0, 
-        enable_ccd=True, # 관통 방지
+        enable_ccd=True, # [중요] 관통(Tunneling) 방지
     ),
     articulation_props=UR10E_W_SPINDLE_CFG.spawn.articulation_props,
 )
@@ -89,7 +89,6 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
             scale=(1.0, 1.0, 1.0),   
             
             # [논문 아이디어: 강체 역학]
-            # 로봇이 힘을 가했을 때 물체가 밀리면 학습이 안 됩니다.
             # kinematic_enabled=True로 설정하여 완벽한 고정체(벽)로 만듭니다.
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 kinematic_enabled=True, 
@@ -99,7 +98,7 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
             physics_material=sim_utils.RigidBodyMaterialCfg(
                 static_friction=1.0,
                 dynamic_friction=1.0,
-                restitution=0.0, 
+                restitution=0.0, # 튕김 없음
             ),
         ),
         init_state=AssetBaseCfg.InitialStateCfg(
@@ -108,7 +107,7 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    # 3. Robot Actuator Tuning (가장 중요)
+    # 3. Robot Actuator Tuning (진동 억제의 핵심)
     robot: ArticulationCfg = TEMP_ROBOT_CFG.replace(
         prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot",
         init_state=ArticulationCfg.InitialStateCfg(
@@ -118,11 +117,11 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
         actuators={
             "arm": ImplicitActuatorCfg(
                 joint_names_expr=[".*"],
-                # [논문 아이디어: 임피던스 제어 흉내]
-                # Stiffness(P게인)를 적당히 유지하되, 
-                # Damping(D게인)을 높여서 '허공 휘젓기(Oscillation)'를 물리적으로 막습니다.
+                # [튜닝 포인트]
+                # Stiffness: 위치를 지키려는 힘 (너무 높으면 튐)
+                # Damping: 진동을 흡수하는 힘 (너무 낮으면 떨림) -> 80.0으로 상향
                 stiffness=200.0,   
-                damping=80.0,  # 기존 60 -> 80으로 상향 (진동 억제)
+                damping=80.0,  
             ),
         }
     )
@@ -152,12 +151,12 @@ class CommandsCfg:
 @configclass
 class ActionsCfg:
     # [논문 아이디어: Action Scaling]
-    # "허공을 휘젓는" 가장 큰 이유는 한 스텝당 움직이는 각도가 너무 크기 때문입니다.
-    # 스케일을 0.01에서 0.005로 줄여서, 로봇이 아주 미세하고 부드럽게 움직이도록 강제합니다.
+    # 스케일을 0.01 -> 0.005로 줄여서 로봇의 '급발진'을 물리적으로 막습니다.
+    # 학습 초기에는 답답해 보일 수 있으나, 정밀 작업에는 필수입니다.
     arm_action: ActionTerm = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=[".*"],
-        scale=0.005, # [수정] 0.01 -> 0.005 (정밀 제어)
+        scale=0.005, 
         use_default=True, 
     )
     gripper_action: ActionTerm | None = None
@@ -167,6 +166,7 @@ class ActionsCfg:
 class ObservationsCfg:
     @configclass
     class PolicyCfg(ObsGroup):
+        # observations.py에 새로 추가한 로직들이 반영됩니다.
         path_tracking = ObsTerm(func=local_obs.path_tracking_obs)
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel = ObsTerm(func=mdp.joint_vel_rel)
@@ -182,26 +182,24 @@ class ObservationsCfg:
 @configclass
 class RewardsCfg:
     # [논문 아이디어: Reward Shaping]
-    # 로봇이 원하는 행동을 했을 때만 점수를 줍니다.
     
-    # 1. 경로 추종 (가장 중요)
+    # 1. 경로 추종 (Main Task)
     track_path = RewTerm(func=local_rew.track_path_reward, weight=15.0, params={"sigma": 0.1})
     
-    # 2. 자세 유지 (수직 유지) - 가중치 대폭 상향
-    orientation = RewTerm(func=local_rew.orientation_align_reward, weight=30.0) # 기존 20 -> 30
+    # 2. 자세 유지 (수직) - 가중치 대폭 상향 (20->30)
+    orientation = RewTerm(func=local_rew.orientation_align_reward, weight=30.0) 
     
-    # 3. 힘 제어 (표면에 닿아야 함)
-    force_control = RewTerm(func=local_rew.force_control_reward, weight=2.0, params={"target_force": 10.0})
+    # 3. 힘 제어 (Contact)
+    force_control = RewTerm(func=local_rew.force_control_reward, weight=3.0, params={"target_force": 10.0})
 
-    # [신규 추가] 표면 접근 보상
-    # 로봇이 허공에 있으면 점수를 못 받으므로 바닥으로 내려가게 유도합니다.
-    # (local_rew에 해당 함수가 없다면 mdp.root_height_below 등으로 대체 가능하나, 일단 개념적으로 추가)
-    # 구현이 어렵다면 track_path 가중치를 높이는 것으로 대체됩니다.
+    # 4. [신규] 표면 접근 (Approach)
+    # 로봇이 표면 근처(3cm)까지 내려오도록 강하게 유도합니다.
+    # 이게 없으면 로봇은 허공에서 안전하게 있으려고만 합니다.
+    approach = RewTerm(func=local_rew.surface_approach_reward, weight=5.0, params={"target_height": 0.03})
 
     # Penalties (벌점)
-    # [논문 아이디어: 에너지 최소화]
-    # 관절을 너무 빨리 움직이면(휘저으면) 감점합니다.
-    joint_vel = RewTerm(func=local_rew.joint_vel_penalty, weight=-0.1) # 가중치 상향 (-0.05 -> -0.1)
+    # 속도 페널티를 높여서(-0.05 -> -0.1) 천천히 부드럽게 움직이게 유도
+    joint_vel = RewTerm(func=local_rew.joint_vel_penalty, weight=-0.1)
     
     smoothness = RewTerm(func=local_rew.action_smoothness_penalty, weight=-0.05)
     out_of_bounds = RewTerm(func=local_rew.out_of_bounds_penalty, weight=-5.0)
@@ -209,13 +207,14 @@ class RewardsCfg:
 
 @configclass
 class EventCfg:
-    # [수정됨] 방법 2 적용: 랜덤성이 가미된 수직 자세 리셋
-    # 매 에피소드마다 약간씩 다른 위치/각도에서 시작하여 일반화 성능을 높입니다.
+    # [수정됨] 초기화 전략 (Method 2)
+    # 매 에피소드마다 '수직 자세'를 기준으로 ±0.05 rad 정도의 랜덤 오차를 두고 시작합니다.
+    # 이는 로봇이 다양한 시작 자세에서도 복구하는 능력을 기르게 합니다.
     reset_robot_joints = EventTerm(
         func=mdp.reset_joints_by_offset,
         mode="reset",
         params={
-            "position_range": (-0.05, 0.05), # 위치 노이즈 감소 (너무 멀리 안 가게)
+            "position_range": (-0.05, 0.05), # 너무 크지 않은 노이즈
             "velocity_range": (0.0, 0.0),    # 정지 상태 시작
         },
     )
@@ -225,7 +224,7 @@ class EventCfg:
 class TerminationsCfg:
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
     
-    # [안전장치]
+    # [안전장치] 로봇이 바닥을 뚫고 지하로 너무 내려가면(-5cm) 에피소드 종료
     underground_death = DoneTerm(
         func=mdp.root_height_below_minimum,
         params={"minimum_height": -0.05, "asset_cfg": SceneEntityCfg("robot")}
@@ -254,10 +253,11 @@ class RobotarmEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.dt = 1.0 / 120.0 
         self.sim.render_interval = self.decimation
         
-        # [PhysX 설정] 진동 억제
-        self.sim.physx.bounce_threshold_velocity = 0.5 # 조금 둔감하게 설정
+        # [PhysX 설정] 물리 안정성 강화
+        # 접촉 시 튀는 속도(bounce) 임계값을 높여서 미세한 진동을 무시하게 함
+        self.sim.physx.bounce_threshold_velocity = 0.5 
         self.sim.physx.enable_stabilization = True
-        self.sim.physx.gpu_max_rigid_contact_count = 1024 * 1024 # 접촉 버퍼 늘리기
+        self.sim.physx.gpu_max_rigid_contact_count = 1024 * 1024 
         
         self.wp_size_x = 0.5
         self.wp_size_y = 0.5
