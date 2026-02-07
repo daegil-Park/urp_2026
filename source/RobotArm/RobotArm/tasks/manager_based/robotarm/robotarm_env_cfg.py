@@ -1,15 +1,16 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
-# All rights reserved.
-#
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers
 # SPDX-License-Identifier: BSD-3-Clause
 
 import math
+import copy
+import torch
+import numpy as np
 
+from isaaclab.actuators import ImplicitActuatorCfg
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import ActionTermCfg as ActionTerm
-from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -18,274 +19,300 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
+from isaaclab.utils.math import scale_transform, quat_mul, quat_conjugate
+from isaaclab.sensors import ContactSensorCfg
+
+import isaaclab.envs.mdp as mdp
+from .mdp import observations as local_obs 
+from .mdp import rewards as local_rew 
+
+from RobotArm.robots.ur10e_w_spindle import UR10E_W_SPINDLE_CFG
+
+# =========================================================================
+# [Action] 디버깅 로그가 포함된 하이브리드 액션 (이름 문제 해결)
+# =========================================================================
+class HybridPolishingAction(ActionTerm):
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self.joint_ids, _ = env.scene.find_joints(cfg.asset_name, cfg.joint_names)
+        self.num_joints = len(self.joint_ids)
+        self._action_dim = 12 
+        
+        # State: 0(Align), 1(Descend), 2(Magnet Polish)
+        self.state = torch.zeros(env.num_envs, dtype=torch.int, device=env.device) 
+        self.timer = torch.zeros(env.num_envs, device=env.device)
+        self.path_timer = torch.zeros(env.num_envs, device=env.device)
+        self.contact_z = torch.zeros(env.num_envs, device=env.device)
+
+        # RL 파라미터 범위
+        self.k_pos_range = torch.tensor([10.0, 1500.0], device=env.device)
+        self.k_rot_range = torch.tensor([100.0, 1000.0], device=env.device) 
+        self.d_range = torch.tensor([10.0, 150.0], device=env.device)
+
+        # 작업 중심점 (Green Box Center)
+        self.center_x = 0.75
+        self.center_y = 0.0
+        
+        # [DEBUG] 실행 확인용 플래그
+        self.debug_printed = False
+
+    @property
+    def action_dim(self) -> int:
+        return self._action_dim
+
+    def process_actions(self, actions: torch.Tensor):
+        # [DEBUG] 이 로그가 터미널에 안 뜨면 파일 경로가 잘못된 것입니다.
+        if not self.debug_printed:
+            print("\n" + "="*60)
+            print("🚀 [HybridPolishingAction] ACTION LOADED SUCCESSFULLY!")
+            print("   Mode: Align -> Vertical Descend -> Magnet Polish")
+            print("="*60 + "\n")
+            self.debug_printed = True
+            
+        dt = self._env.step_dt
+        self.timer += dt
+        
+        # 1. Robot & Sensor State
+        robot = self._env.scene[self.cfg.asset_name]
+        ee_pos = robot.data.body_pos_w[:, -1, :]   
+        ee_quat = robot.data.body_quat_w[:, -1, :] 
+        
+        sensor = self._env.scene.sensors["contact_forces"]
+        # Z축 힘 (절댓값)
+        force_z = torch.abs(sensor.data.net_forces_w[..., 2]).max(dim=-1)[0]
+
+        # 2. Target Init (수직 쿼터니언 고정)
+        target_pos = ee_pos.clone()
+        # [0, 1, 0, 0]이 UR10e Base 기준 바닥을 보는 자세 (사용자 환경에 맞게 조정 가능)
+        target_quat = torch.tensor([0.0, 1.0, 0.0, 0.0], device=self._env.device).repeat(self._env.num_envs, 1)
+
+        # RL Params Decoding
+        k_pos = scale_transform(actions[:, 0:3], self.k_pos_range[0], self.k_pos_range[1])
+        k_rot = scale_transform(actions[:, 3:6], self.k_rot_range[0], self.k_rot_range[1])
+        d_pos = scale_transform(actions[:, 6:9], self.d_range[0], self.d_range[1])
+        d_rot = scale_transform(actions[:, 9:12], self.d_range[0], self.d_range[1])
+
+        # 자석 바이어스 힘 (기본 0)
+        F_bias = torch.zeros_like(ee_pos)
+
+        # ------------------------------------------------------------------
+        # State 0: Align (상공 20cm 정렬 & 대기)
+        # ------------------------------------------------------------------
+        mask_align = (self.state == 0)
+        if torch.any(mask_align):
+            target_pos[mask_align, 0] = self.center_x
+            target_pos[mask_align, 1] = self.center_y
+            target_pos[mask_align, 2] = 0.20 
+            
+            # 아주 단단하게 고정
+            k_pos[mask_align] = 2000.0
+            k_rot[mask_align] = 2000.0 
+            d_pos[mask_align] = 100.0
+
+            # 오차 확인 (안정화)
+            err = torch.norm(target_pos[mask_align] - ee_pos[mask_align], dim=-1)
+            ready = (self.timer > 2.0) & (err < 0.02)
+            
+            switch_ids = torch.nonzero(mask_align).flatten()[ready]
+            if len(switch_ids) > 0:
+                self.state[switch_ids] = 1
+                self.timer[switch_ids] = 0.0
+        
+        # ------------------------------------------------------------------
+        # State 1: Descend (수직 하강 - 드릴 프레스)
+        # ------------------------------------------------------------------
+        mask_descend = (self.state == 1)
+        if torch.any(mask_descend):
+            # XY 절대 고정
+            target_pos[mask_descend, 0] = self.center_x
+            target_pos[mask_descend, 1] = self.center_y
+            # Z만 0.5mm씩 하강
+            target_pos[mask_descend, 2] = ee_pos[mask_descend, 2] - 0.0005
+            
+            k_pos[mask_descend] = 1000.0
+            k_rot[mask_descend] = 2000.0
+            
+            # 접촉 감지 (2N)
+            contacted = (force_z > 2.0)
+            switch_ids = torch.nonzero(mask_descend).flatten()[contacted[mask_descend]]
+            
+            if len(switch_ids) > 0:
+                self.state[switch_ids] = 2
+                self.contact_z[switch_ids] = ee_pos[switch_ids, 2]
+                self.timer[switch_ids] = 0.0
+                self.path_timer[switch_ids] = 0.0
+
+        # ------------------------------------------------------------------
+        # State 2: Magnet Polishing (자석 모드)
+        # ------------------------------------------------------------------
+        mask_polish = (self.state == 2)
+        if torch.any(mask_polish):
+            self.path_timer[mask_polish] += dt
+            t = self.path_timer[mask_polish]
+            
+            # [자석 1] 목표: 지하 2cm (물리엔진이 막아줌 -> 압착)
+            target_z = self.contact_z[mask_polish] - 0.02
+            
+            # [자석 2] ㄹ자 경로
+            path_x = self.center_x + 0.15 * torch.sin(0.2 * t)
+            path_y = 0.2 * torch.sin(3.0 * t)
+            
+            target_pos[mask_polish, 0] = path_x
+            target_pos[mask_polish, 1] = path_y
+            target_pos[mask_polish, 2] = target_z
+            
+            # [자석 3] 회전 강성 최소값 보장
+            k_rot[mask_polish] = torch.clamp(k_rot[mask_polish], min=500.0)
+            
+            # [자석 4] Bias Force (-20N) -> 인공 중력 추가
+            F_bias[mask_polish, 2] = -20.0 
+
+        # 3. OSC Calculation
+        pos_err = target_pos - ee_pos
+        quat_inv = quat_conjugate(ee_quat)
+        q_diff = quat_mul(target_quat, quat_inv)
+        rot_err = 2.0 * torch.sign(q_diff[:, 0]).unsqueeze(1) * q_diff[:, 1:]
+        
+        vel_lin = robot.data.body_vel_w[:, -1, :3]
+        vel_ang = robot.data.body_vel_w[:, -1, 3:]
+        
+        # F = (K*err - D*vel) + Bias
+        F_pos = (k_pos * pos_err - d_pos * vel_lin) + F_bias
+        F_rot = k_rot * rot_err - d_rot * vel_ang
+        
+        F_task = torch.cat([F_pos, F_rot], dim=-1)
+        
+        jacobian = robot.data.jacobian_w[:, self.joint_ids, :]
+        j_t = jacobian.transpose(-2, -1)
+        desired_torque = torch.bmm(j_t, F_task.unsqueeze(-1)).squeeze(-1)
+        
+        robot.set_joint_effort_target(desired_torque, joint_ids=self.joint_ids)
+
+    def reset(self, env_ids: torch.Tensor | None = None):
+        if env_ids is None:
+            env_ids = slice(None)
+        self.state[env_ids] = 0
+        self.timer[env_ids] = 0.0
+        self.path_timer[env_ids] = 0.0
 
 
-from . import mdp
-
-# reward, observation modul import
-import importlib
-local_obs = importlib.import_module("RobotArm.tasks.manager_based.robotarm.mdp.observations")
-local_rew = importlib.import_module("RobotArm.tasks.manager_based.robotarm.mdp.rewards")
-
-##
-# Pre-defined configs
-##
-
-from RobotArm.robots.ur10e_w_spindle import *
-
-# solver = nrs_ik_core.IKSolver(tool_z=0.2, use_degrees=True)
-# angle = solver.compute(pose)
-
-##
-# Scene definition
-##
-
+# =========================================================================
+# Scene Config (물리 엔진 강화)
+# =========================================================================
+USER_STL_PATH = "/home/nrs2/RobotArm2026/flat_surface.stl"
+DEVICE_READY_STATE = {
+    "shoulder_pan_joint": 0.0, "shoulder_lift_joint": -1.5708, "elbow_joint": -1.5708,
+    "wrist_1_joint": -1.5708, "wrist_2_joint": 1.5708, "wrist_3_joint": 0.0,
+}
 
 @configclass
 class RobotarmSceneCfg(InteractiveSceneCfg):
-    """Configuration for the scene with a robotic arm."""
-
-    # ground plane
     ground = AssetBaseCfg(
         prim_path="/World/ground",
         spawn=sim_utils.GroundPlaneCfg(),
         init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0)),
     )
-
+    
+    # [Box] 단단한 바닥
     workpiece = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Workpiece",
-        spawn=sim_utils.UsdFileCfg(
-            usd_path="/home/eunseop/isaac/isaac_save/flat_surface_2.usd"
+        spawn=sim_utils.CuboidCfg(
+            size=(1.0, 1.0, 0.1),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=True, disable_gravity=True,
+                solver_position_iteration_count=16, solver_velocity_iteration_count=8,
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.005),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.5, 0.0)),
         ),
-        init_state=AssetBaseCfg.InitialStateCfg(
-            pos=(0.75, 0.0, 0.0),
-            rot=(1.0, 0.0, 0.0, 0.0),
-        ),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.75, 0.0, 0.0)),
     )
+    
+    # [Robot] 힘 제한 및 물리 강화
+    robot: ArticulationCfg = UR10E_W_SPINDLE_CFG.replace(
+        prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot",
+        init_state=ArticulationCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0), joint_pos=DEVICE_READY_STATE),
+        actuators={
+            "arm": ImplicitActuatorCfg(
+                joint_names_expr=[".*"], 
+                effort_limit=150.0, 
+                velocity_limit=100.0,
+                stiffness=0.0, # Torque Mode
+                damping=2.0,   
+            ),
+        }
+    )
+    robot.spawn.rigid_props.enable_ccd = True 
+    robot.spawn.rigid_props.solver_position_iteration_count = 16
 
-    # robot
-    robot: ArticulationCfg = UR10E_W_SPINDLE_CFG.replace(prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot")
-
-    # lights
+    contact_forces = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot/.*", history_length=3, track_air_time=False,
+    )
     dome_light = AssetBaseCfg(
-        prim_path="/World/Light",
-        spawn=sim_utils.DomeLightCfg(color=(0.9, 0.9, 0.9), intensity=500.0),
+        prim_path="/World/Light", spawn=sim_utils.DomeLightCfg(color=(0.9, 0.9, 0.9), intensity=500.0),
     )
 
 
-##
-# MDP settings
-##
-
-@configclass
-class CommandsCfg:
-    """Command terms for the MDP."""
-    pass
-    # ee_pose = mdp.UniformPoseCommandCfg(
-    #     asset_name="robot",
-    #     body_name=EE_FRAME_NAME,
-    #     resampling_time_range=(0.5, 1.0),
-    #     debug_vis=True,
-    #     ranges=mdp.UniformPoseCommandCfg.Ranges(
-    #         pos_x=(0.0, 0.5),   # 작업 면적
-    #         pos_y=(0.0, 1.0),
-    #         pos_z=(0.05, 0.1),
-    #         roll=(-3.14, 3.14),
-    #         pitch=(-1.57, 1.57),  # depends on end-effector axis
-    #         yaw=(-3.14, 3.14),
-    #     ),
-    # )
-
-
+# =========================================================================
+# MDP Config
+# =========================================================================
 @configclass
 class ActionsCfg:
-    """Action specifications for the MDP."""
-
-    #joint_effort = mdp.JointEffortActionCfg(asset_name="robot", joint_names=["slider_to_cart"], scale=100.0)
-    arm_action: ActionTerm = mdp.JointPositionActionCfg(
-        asset_name="robot",
-        joint_names=[
-            "shoulder_pan_joint",
-            "shoulder_lift_joint",
-            "elbow_joint",
-            "wrist_1_joint",
-            "wrist_2_joint",
-            "wrist_3_joint",
-        ],
-        #use_default=True,
-        scale=0.5,
+    # [CRITICAL] 이름을 'arm_action'으로 하여 시스템이 무조건 읽게 함
+    arm_action = ActionTerm(
+        func=HybridPolishingAction, 
+        params={"asset_name": "robot", "joint_names": [".*"]}
     )
     gripper_action: ActionTerm | None = None
 
 @configclass
 class ObservationsCfg:
-    """Observation specifications for the MDP."""
-    
     @configclass
     class PolicyCfg(ObsGroup):
-        """Observations for policy group."""
-
-        grid_mask_state = ObsTerm(      # Grid Mask의 상태: Policy가 방문하지 않은 곳을 찾아가도록 유도
-            func=local_obs.grid_mask_state_obs,
-            params={
-                "grid_mask_history_len": 1,
-            }
-        )
-
-        ee_pose_history = ObsTerm(
-            func=local_obs.ee_pose_history,
-            params={
-                "history_len": 10,
-                },
-        )
-
-
+        path_tracking = ObsTerm(func=local_obs.path_tracking_obs)
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+        ee_history = ObsTerm(func=local_obs.ee_pose_history)
         def __post_init__(self):
-            self.enable_corruption = True
+            self.enable_corruption = False
             self.concatenate_terms = True
-
-    # observation groups
     policy: PolicyCfg = PolicyCfg()
-
-
-@configclass
-class EventCfg:
-    """Configuration for events."""
-
-    # reset
-    reset_robot_joints = EventTerm(
-        func=mdp.reset_joints_by_offset,
-        mode="reset",
-        params={
-            "position_range": (0, 0),
-            "velocity_range": (0.0, 0.0),
-        },
-    )
-
-    reset_grid_mask = EventTerm(
-        func=local_rew.reset_grid_mask,
-        mode="reset",
-    )
-
 
 @configclass
 class RewardsCfg:
-    """Reward terms for the MDP."""
-   
-    coverage = RewTerm(
-        func=local_rew.coverage_reward,
-        weight=2.0,
-        params={"exp_scale": 4.0},
-    )
-
-    out_of_bounds_penalty = RewTerm(
-        func=local_rew.out_of_bounds_penalty,
-        weight=5.0
-    )
-
-    # 중복 방문 벌점을 0.5 -> 0.0으로 삭제
-    revisit_penalty = RewTerm(
-        func=local_rew.revisit_penalty,
-        weight=0.5,
-    )
-
-    # 표면 높이 유지
-    surface_proximity = RewTerm(
-        func=local_rew.surface_proximity_reward,
-        weight=15.0,
-    )
-    
-    # 수직 자세 유지
-    ee_orientation_alignment = RewTerm(
-        func=local_rew.ee_orientation_alignment,
-        weight=18.0,
-        params={"target_axis": (0.0, 0.0, -1.0)},
-    )
-
-    # 시간 효율성
-    time_efficiency = RewTerm(
-        func=local_rew.time_efficiency_reward,
-        weight=5.0,
-        params={"max_steps": 1200},
-    )
+    force_tracking = RewTerm(func=local_rew.force_tracking_reward, weight=100.0, params={"target_force": 10.0})
+    orientation_align = RewTerm(func=local_rew.orientation_align_reward, weight=80.0, params={"target_axis": (0,0,-1)})
+    track_path = RewTerm(func=local_rew.track_path_reward, weight=30.0, params={"sigma": 0.1})
+    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.5)
+    out_of_bounds = RewTerm(func=local_rew.out_of_bounds_penalty, weight=-10.0)
 
 @configclass
 class TerminationsCfg:
-    """Termination terms for the MDP."""
-
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
-    
-    # 커버리지 100% 달성 시 에피소드 종료
-    coverage_success = DoneTerm(func=local_rew.check_coverage_success)
+    bad_orientation = DoneTerm(func=local_rew.bad_orientation_termination, params={"limit_angle": 0.78})
 
 @configclass
-class CurriculumCfg:
-    """Curriculum terms for the MDP."""
-
-    # coverage_curriculum = CurrTerm(
-    #     func=mdp.modify_reward_weight,
-    #     params={
-    #         "term_name": "coverage",
-    #         "weight": -0.0004,
-    #         "num_steps": 10000}
-    # )
-
-    # out_of_bounds_curriculum = CurrTerm(
-    #     func=mdp.modify_reward_weight,
-    #     params={
-    #         "term_name": "out_of_bounds_penalty",
-    #         "weight": 0.0002,
-    #         "num_steps": 5000}
-    # )
-
-    # ee_orientation_curriculum = CurrTerm(
-    #     func=mdp.modify_reward_weight,
-    #     params={
-    #         "term_name": "ee_orientation_alignment",
-    #         "weight": 0.0003,
-    #         "num_steps":7000}
-    # )
-
-    # time_efficiency_curriculum = CurrTerm(
-    #     func=mdp.modify_reward_weight,
-    #     params={
-    #         "term_name": "time_efficiency",
-    #         "weight": 0.0001,
-    #         "num_steps": 10000}
-    # )
-
-
-
-##
-# Environment configuration
-##
+class EventCfg:
+    reset_robot_joints = EventTerm(
+        func=mdp.reset_joints_by_offset, mode="reset",
+        params={"position_range": (-0.02, 0.02), "velocity_range": (0.0, 0.0)}
+    )
 
 @configclass
 class RobotarmEnvCfg(ManagerBasedRLEnvCfg):
-    """Configuration for the reach end-effector pose tracking environment."""
-
-    # Scene settings
-    scene: RobotarmSceneCfg = RobotarmSceneCfg(num_envs=128, env_spacing=2.5)
-    # Basic settings
+    scene: RobotarmSceneCfg = RobotarmSceneCfg(num_envs=64, env_spacing=2.5)
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
-    events: EventCfg = EventCfg()
-    commands: CommandsCfg = CommandsCfg()
-    # MDP settings
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
+    events: EventCfg = EventCfg()
+    commands: CommandsCfg = CommandsCfg()
     curriculum: CurriculumCfg = CurriculumCfg()
 
-    # Post initialization
     def __post_init__(self) -> None:
-        """Post initialization."""
-        # general settings
-        self.decimation = 2
+        self.decimation = 4
         self.episode_length_s = 20.0
-        # viewer settings
-        self.viewer.eye = (3.5, 3.5, 3.5)
-        # simulation settings
-        self.sim.dt = 1.0 / 60.0
-        self.sim.render_interval = self.decimation
+        self.sim.dt = 1.0 / 120.0
+        self.sim.substeps = 2
+        self.sim.physx.bounce_threshold_velocity = 0.5
+        self.sim.physx.enable_stabilization = True
