@@ -1,3 +1,6 @@
+# 파일 맨 윗줄에 아래처럼 적고 저장하세요
+ZZZZZZZZZZ_ERROR_TEST  <-- 이거 추가
+
 # Copyright (c) 2022-2025, The Isaac Lab Project Developers
 # SPDX-License-Identifier: BSD-3-Clause
 
