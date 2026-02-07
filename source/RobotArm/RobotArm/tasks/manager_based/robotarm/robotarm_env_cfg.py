@@ -3,7 +3,6 @@
 
 import math
 import copy
-import os
 import torch
 
 from isaaclab.actuators import ImplicitActuatorCfg
@@ -19,26 +18,25 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.math import scale_transform
+from isaaclab.utils.math import scale_transform, quat_from_euler_xyz, quat_mul, quat_conjugate, quat_rotate
 from isaaclab.sensors import ContactSensorCfg
 
 # Custom MDP modules
 import isaaclab.envs.mdp as mdp
 from .mdp import observations as local_obs 
 from .mdp import rewards as local_rew 
-from .mdp import path_loader # 경로 로더 필수
 
 from RobotArm.robots.ur10e_w_spindle import UR10E_W_SPINDLE_CFG
 
 # =========================================================================
-# [핵심] 가변 임피던스 액션 클래스 (파일 통합)
+# [핵심] ㄹ자 경로 폴리싱 액션 (Operational Space Control)
 # =========================================================================
-class VariableImpedanceAction(ActionTerm):
+class RasterPolishingAction(ActionTerm):
     """
-    [조교님 조언 & 논문 3 구현]
-    RL 에이전트가 위치를 직접 제어하는 것이 아니라,
-    '강성(Stiffness, K)'과 '감쇠(Damping, D)'를 최적화하여 
-    주어진 경로(Path)를 부드럽게 따라가는 토크를 생성합니다.
+    [로봇청소기 모드]
+    1. 수학적으로 'ㄹ자(Raster Scan)' 경로를 생성합니다. (경로 파일 대체용)
+    2. Operational Space Control(OSC)을 사용하여 EE가 경로를 따라가게 합니다.
+    3. RL은 이 제어기의 강성(Stiffness)과 감쇠(Damping)를 튜닝합니다.
     """
 
     def __init__(self, cfg, env):
@@ -46,64 +44,110 @@ class VariableImpedanceAction(ActionTerm):
         self.joint_ids, _ = env.scene.find_joints(cfg.asset_name, cfg.joint_names)
         self.num_joints = len(self.joint_ids)
         
-        # Action Dim: 관절 수 * 2 (각 관절의 K와 D를 제어)
-        self._action_dim = self.num_joints * 2
+        # Action Dim: Stiffness(6) + Damping(6) = 12
+        # (XYZ 위치 강성 + RX,RY,RZ 회전 강성 / XYZ 감쇠 + 회전 감쇠)
+        self._action_dim = 12 
         
-        # [튜닝 포인트] 논문 기반 파라미터 범위
-        # K (Stiffness): 낮을수록 부드러움 (접촉 시 유리), 높을수록 정확함 (이동 시 유리)
-        self.stiff_range = torch.tensor([10.0, 300.0], device=env.device) 
-        # D (Damping): 진동을 잡는 역할. 너무 크면 로봇이 뻑뻑해짐.
-        self.damp_range = torch.tensor([5.0, 80.0], device=env.device)
+        # [튜닝] RL이 조절할 물성치 범위
+        # 폴리싱은 위치는 단단하게(High K), 회전은 조금 유연하게, 접촉은 부드럽게(High D)
+        self.stiff_range = torch.tensor([50.0, 1000.0], device=env.device) 
+        self.damp_range = torch.tensor([10.0, 150.0], device=env.device)
+        
+        self.time_idx = torch.zeros(env.num_envs, device=env.device)
 
     @property
     def action_dim(self) -> int:
         return self._action_dim
 
     def process_actions(self, actions: torch.Tensor):
-        # 1. Action 분리 (K, D)
-        # actions shape: (num_envs, 12) -> 앞 6개 K, 뒤 6개 D
-        k_actions = actions[:, :self.num_joints]
-        d_actions = actions[:, self.num_joints:]
+        dt = self._env.step_dt
+        self.time_idx += dt
+        
+        # 1. RL Action -> Impedance Gains (K, D)
+        # actions: (num_envs, 12)
+        # XYZ+Rot Stiffness / XYZ+Rot Damping
+        Kp = scale_transform(actions[:, :6], self.stiff_range[0], self.stiff_range[1])
+        Kd = scale_transform(actions[:, 6:], self.damp_range[0], self.damp_range[1])
 
-        # 2. 스케일링 (-1~1 값을 실제 물리 수치로 변환)
-        target_k = scale_transform(k_actions, self.stiff_range[0], self.stiff_range[1])
-        target_d = scale_transform(d_actions, self.damp_range[0], self.damp_range[1])
+        # 2. [ㄹ자 경로 생성] (Raster Scan Path)
+        # "나중에는 경로 파일을 넣겠지만, 지금은 수식으로 만듦"
+        # 중심점: (0.75, 0.0, 0.05)
+        # X축: 천천히 전진 (Velocity = 2cm/s)
+        # Y축: 빠르게 왕복 (Frequency = 0.5Hz, Amplitude = 15cm)
+        
+        center_x = 0.75
+        center_z = 0.03 # 표면 살짝 위 (3cm) - 누르는 힘은 RL이 K 조절로 결정
+        
+        # X: -0.15 ~ +0.15 범위를 왕복
+        path_x = center_x + 0.15 * torch.sin(0.2 * self.time_idx) 
+        # Y: -0.2 ~ +0.2 범위를 빠르게 왕복 (ㄹ자)
+        path_y = 0.2 * torch.sin(3.0 * self.time_idx)
+        path_z = torch.full_like(path_x, center_z)
+        
+        target_pos = torch.stack([path_x, path_y, path_z], dim=-1)
 
-        # 3. 로봇 상태 가져오기
+        # 3. [자세 생성] 무조건 바닥(수직) 보기
+        # UR10e 기준: EE Z축이 World -Z를 봐야 함 (또는 X축 회전 -180도)
+        # Quaternion for looking down (Euler: 180, 0, 0 or similar depending on UR convention)
+        # 여기서는 World Frame 기준 Fixed Orientation
+        target_quat = torch.tensor([0.0, 1.0, 0.0, 0.0], device=self._env.device).repeat(self._env.num_envs, 1) 
+        # (Note: 쿼터니언 값은 로봇의 기본 자세에 따라 [0, 1, 0, 0]이 180도 회전일 수 있음. 확인 필요)
+
+        # 4. 로봇 상태 (Jacobian & EE State)
         robot = self._env.scene[self.cfg.asset_name]
-        current_q = robot.data.joint_pos[:, self.joint_ids]
-        current_v = robot.data.joint_vel[:, self.joint_ids]
+        # Jacobian: (num_envs, 6, num_joints)
+        jacobian = robot.data.jacobian_w[:, self.joint_ids, :] 
+        
+        ee_pos = robot.data.body_pos_w[:, -1, :]
+        ee_quat = robot.data.body_quat_w[:, -1, :]
+        ee_vel_lin = robot.data.body_vel_w[:, -1, :3]
+        ee_vel_ang = robot.data.body_vel_w[:, -1, 3:]
 
-        # 4. 목표 경로(Target) 가져오기
-        # "경로는 주어졌다"는 가정하에, path_loader에서 가장 가까운 목표점을 가져옵니다.
-        # (단순화를 위해 여기서는 IK 없이 Joint Space 오차를 사용하거나, 
-        #  Task Space 제어를 해야 하지만, 코드가 복잡해지므로 
-        #  '현재 위치 유지(Stabilization)' + 'RL이 오차 보정' 방식으로 근사합니다.)
+        # 5. 오차 계산 (Task Space Error)
+        # Position Error
+        pos_error = target_pos - ee_pos
         
-        # *개선된 방식*: RL이 K, D 뿐만 아니라 미세한 위치 보정(delta_q)도 하게 할 수 있지만,
-        # 여기서는 조교님 의도대로 '파라미터 튜닝'에 집중하기 위해 Target을 고정하거나 
-        # path_loader의 목표를 따라갑니다. (여기서는 간단히 0번 자세 유지로 가정 -> 실제론 path_loader 연동 필요)
-        # 일단은 안정성을 위해 '현재 위치'를 유지하려는 힘을 기본으로 하되, 
-        # 외부 힘(접촉)에 대해 K, D로 반응하도록 합니다.
-        target_q = current_q.clone() # (실제 구현 시엔 path_loader의 target joint 값 필요)
+        # Orientation Error (Quaternion Difference)
+        # q_err = q_des * q_curr_inv
+        quat_inv = quat_conjugate(ee_quat)
+        q_diff = quat_mul(target_quat, quat_inv)
+        # Convert to rotation vector (Axis-Angle) approximation
+        # q = [w, x, y, z]. If w~1, angle is small. vec ~= 2*[x,y,z]
+        # (Sign flip check needed for w < 0)
+        sign = torch.sign(q_diff[:, 0]).unsqueeze(1)
+        rot_error = 2.0 * sign * q_diff[:, 1:] # (num_envs, 3)
 
-        # 5. 임피던스 토크 계산 (Impedance Law)
-        # Torque = K * (q_des - q) - D * q_dot
-        # q_des - q 가 0이라면(Target=Current), 이 로봇은 '댐퍼(D)' 역할만 하여 진동을 잡습니다.
-        # 움직이려면 q_des가 변해야 합니다.
-        
-        desired_torque = target_k * (target_q - current_q) - target_d * current_v
-        
-        # 6. 토크 적용
+        # Total Error Vector (6D)
+        error_task = torch.cat([pos_error, rot_error], dim=-1) # (num_envs, 6)
+        velocity_task = torch.cat([ee_vel_lin, ee_vel_ang], dim=-1) # (num_envs, 6)
+
+        # 6. Operational Space Force Calculation
+        # F_task = Kp * Error - Kd * Velocity
+        # (RL이 Kp, Kd를 조절하여 표면을 '얼마나 세게 누를지' 결정)
+        F_task = Kp * error_task - Kd * velocity_task
+
+        # 7. Joint Torque Mapping (Jacobian Transpose)
+        # Tau = J^T * F_task
+        # (num_envs, num_joints, 6) @ (num_envs, 6, 1) -> (num_envs, num_joints)
+        jacobian_T = jacobian.transpose(-2, -1)
+        desired_torque = torch.bmm(jacobian_T, F_task.unsqueeze(-1)).squeeze(-1)
+
+        # 8. 토크 인가
         robot.set_joint_effort_target(desired_torque, joint_ids=self.joint_ids)
 
+    def reset(self, env_ids: torch.Tensor | None = None):
+        if env_ids is None:
+            env_ids = slice(None)
+        self.time_idx[env_ids] = 0.0
+
 
 # =========================================================================
-# [사용자 경로 설정]
+# Scene & Env Config
 # =========================================================================
+
 USER_STL_PATH = "/home/nrs2/RobotArm2026/flat_surface.stl"
 
-# [기본 자세] 수직 하강 자세
+# [수직 자세] 
 DEVICE_READY_STATE = {
     "shoulder_pan_joint": 0.0,
     "shoulder_lift_joint": -1.5708,
@@ -163,8 +207,7 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    # [중요] 로봇을 'Torque Control' 모드로 설정
-    # 임피던스 제어를 위해 하드웨어 게인을 0으로 만들고, 위 Action Class에서 계산한 토크를 직접 줍니다.
+    # [중요] Torque Control Mode
     robot: ArticulationCfg = TEMP_ROBOT_CFG.replace(
         prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot",
         init_state=ArticulationCfg.InitialStateCfg(
@@ -176,8 +219,8 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
                 joint_names_expr=[".*"],
                 effort_limit=300.0,
                 velocity_limit=100.0,
-                stiffness=0.0,    # Torque 제어 필수 설정
-                damping=0.0,      # Torque 제어 필수 설정
+                stiffness=0.0,    # Action에서 OSC로 계산하므로 0
+                damping=0.0,      
             ),
         }
     )
@@ -200,10 +243,9 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
 
 @configclass
 class ActionsCfg:
-    # [통합된 커스텀 액션 사용]
-    # 위에서 정의한 VariableImpedanceAction 클래스를 직접 연결합니다.
-    impedance_control = ActionTerm(
-        func=VariableImpedanceAction,
+    # [교체] ㄹ자 경로 + OSC 제어 액션
+    polishing_motion = ActionTerm(
+        func=RasterPolishingAction,
         params={"asset_name": "robot", "joint_names": [".*"]}
     )
     gripper_action: ActionTerm | None = None
@@ -227,26 +269,26 @@ class ObservationsCfg:
 
 @configclass
 class RewardsCfg:
-    # [조교님 조언: 최적화 관점의 보상 설계]
+    # [폴리싱 최적화 보상]
     
-    # 1. Force Control (최우선) - 목표 힘(10N) 유지
+    # 1. Force Control (최우선)
+    # 10N의 힘으로 지긋이 눌러야 함
     force_control = RewTerm(func=local_rew.force_control_reward, weight=50.0, params={"target_force": 10.0})
 
-    # 2. Stability (진동 억제) - 에너지(Torque) 최소화
-    # 논문 3: "불필요한 토크 사용은 진동의 원인이다"
-    applied_torque = RewTerm(func=mdp.joint_torques_l2, weight=-0.01)
-    joint_vel = RewTerm(func=local_rew.joint_vel_penalty, weight=-0.1) # 천천히
-    
-    # 3. Path Tracking (보조)
-    # 궤적을 완전히 벗어나지만 않게 유도
-    track_path = RewTerm(func=local_rew.track_path_reward, weight=10.0, params={"sigma": 0.1})
-    orientation = RewTerm(func=local_rew.orientation_align_reward, weight=20.0) 
+    # 2. Orientation (필수)
+    # 작업 중에 로봇 손목이 꺾이거나 비틀어지면 안 됨 (수직 유지)
+    orientation = RewTerm(func=local_rew.orientation_align_reward, weight=40.0) 
 
-    # 4. Action Constraints
-    # K, D 값이 급격하게 변하지 않도록 규제
-    smoothness = RewTerm(func=local_rew.action_smoothness_penalty, weight=-0.1)
+    # 3. Path Tracking
+    # ㄹ자 경로를 잘 따라가는지
+    track_path = RewTerm(func=local_rew.track_path_reward, weight=15.0, params={"sigma": 0.1})
+
+    # 4. Stability
+    # 진동 방지
+    applied_torque = RewTerm(func=mdp.joint_torques_l2, weight=-0.01)
+    joint_vel = RewTerm(func=local_rew.joint_vel_penalty, weight=-0.1)
     
-    out_of_bounds = RewTerm(func=local_rew.out_of_bounds_penalty, weight=-5.0)
+    out_of_bounds = RewTerm(func=local_rew.out_of_bounds_penalty, weight=-10.0)
 
 
 @configclass
@@ -260,7 +302,6 @@ class EventCfg:
         },
     )
 
-    # [논문 1: 도메인 랜덤화]
     randomize_friction = EventTerm(
         func=mdp.randomize_rigid_body_material,
         mode="reset",
@@ -313,7 +354,6 @@ class RobotarmEnvCfg(ManagerBasedRLEnvCfg):
         self.episode_length_s = 15.0   
         self.sim.dt = 1.0 / 120.0 
         
-        # [PhysX]
         self.sim.physx.bounce_threshold_velocity = 0.5 
         self.sim.physx.enable_stabilization = True
         self.sim.physx.gpu_max_rigid_contact_count = 1024 * 1024 
