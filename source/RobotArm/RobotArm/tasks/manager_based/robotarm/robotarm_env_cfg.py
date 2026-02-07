@@ -28,21 +28,22 @@ from .mdp import rewards as local_rew
 from RobotArm.robots.ur10e_w_spindle import UR10E_W_SPINDLE_CFG
 
 # =========================================================================
-# [사용자 경로 설정] 사진에 있는 경로 반영
+# [사용자 경로 설정]
 # =========================================================================
-# 스크린샷의 Home > RobotArm2026 폴더 경로입니다.
 USER_STL_PATH = "/home/nrs2/RobotArm2026/flat_surface.stl"
 
 
 # -------------------------------------------------------------------------
-# [수직 자세] 기본 자세 정의
+# [수직 자세] 기본 자세 변경 (수정됨)
 # -------------------------------------------------------------------------
+# 나중에 곡면 작업을 하더라도, 이 자세가 '가공의 기준점(Zero Pose)'이 됩니다.
+# End-Effector가 바닥(-Z)을 수직으로 향하는 자세입니다.
 DEVICE_READY_STATE = {
     "shoulder_pan_joint": 0.0,
-    "shoulder_lift_joint": -1.5708, 
-    "elbow_joint": 1.5708,          
-    "wrist_1_joint": -1.5708,       
-    "wrist_2_joint": -1.5708,       
+    "shoulder_lift_joint": -1.5708, # -90도 (팔을 세움)
+    "elbow_joint": -1.5708,         # -90도 (앞으로 굽힘)
+    "wrist_1_joint": -1.5708,       # -90도 (손목을 아래로 꺾음)
+    "wrist_2_joint": 1.5708,        # +90도 (툴 방향 정렬)
     "wrist_3_joint": 0.0,
 }
 
@@ -64,7 +65,7 @@ TEMP_ROBOT_CFG.spawn = sim_utils.UsdFileCfg(
         max_linear_velocity=1000.0,
         max_angular_velocity=1000.0,
         max_depenetration_velocity=1.0, 
-        enable_ccd=True, # [핵심] 고속 이동 시 벽 뚫기 방지
+        enable_ccd=True, 
     ),
     articulation_props=UR10E_W_SPINDLE_CFG.spawn.articulation_props,
 )
@@ -84,24 +85,23 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
     workpiece = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Workpiece",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=USER_STL_PATH,  # 사용자의 STL 파일 경로
-            scale=(1.0, 1.0, 1.0),   # 스케일 (STL 단위가 m가 아니면 수정 필요)
+            usd_path=USER_STL_PATH,  
+            scale=(1.0, 1.0, 1.0),   
             
             # [중요] STL 메쉬를 강체(Rigid Body)로 인식시킴
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                kinematic_enabled=True, # 로봇이 때려도 움직이지 않음 (벽 역할)
+                kinematic_enabled=True, # 벽 역할
                 disable_gravity=True,
             ),
             
             # [핵심] 충돌체(Collider) 강제 활성화
-            # 이 설정이 있어야 로봇이 통과하지 않고 부딪힙니다.
             collision_props=sim_utils.CollisionPropertiesCfg(),
             
-            # 마찰력 설정 (미끄러짐 방지)
+            # 마찰력 설정
             physics_material=sim_utils.RigidBodyMaterialCfg(
                 static_friction=1.0,
                 dynamic_friction=1.0,
-                restitution=0.0, # 튕겨나가지 않음
+                restitution=0.0, 
             ),
         ),
         init_state=AssetBaseCfg.InitialStateCfg(
@@ -115,13 +115,13 @@ class RobotarmSceneCfg(InteractiveSceneCfg):
         prim_path="{ENV_REGEX_NS}/ur10e_w_spindle_robot",
         init_state=ArticulationCfg.InitialStateCfg(
             pos=(0.0, 0.0, 0.0), 
-            joint_pos=DEVICE_READY_STATE, 
+            joint_pos=DEVICE_READY_STATE, # 위에서 정의한 수직 자세 적용
         ),
         actuators={
             "arm": ImplicitActuatorCfg(
                 joint_names_expr=[".*"],
-                stiffness=200.0,   # 제어 강성
-                damping=60.0,      # 진동 억제 (공중 휘젓기 방지)
+                stiffness=200.0,   
+                damping=60.0,      
             ),
         }
     )
@@ -153,7 +153,7 @@ class ActionsCfg:
     arm_action: ActionTerm = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=[".*"],
-        scale=0.01, # [안정화] 동작 크기를 줄여서 물리 엔진 오차 감소
+        scale=0.01, 
         use_default=True, 
     )
     gripper_action: ActionTerm | None = None
@@ -191,17 +191,25 @@ class RewardsCfg:
 
 @configclass
 class EventCfg:
+    # [수정됨] 방법 2 적용: 랜덤성이 가미된 수직 자세 리셋
+    # 기존 'reset_robot_to_cobra' 대신 Isaac Lab 기본 함수를 사용합니다.
     reset_robot_joints = EventTerm(
-        func=local_rew.reset_robot_to_cobra, 
+        func=mdp.reset_joints_by_offset,  # 기본 자세(수직) + 랜덤 노이즈
         mode="reset",
+        params={
+            "position_range": (-0.1, 0.1), # 관절별로 ±0.1 rad 랜덤 변화
+            "velocity_range": (0.0, 0.0),  # 속도는 0으로 시작
+        },
     )
+    # 나중에 곡면 작업을 할 때, '방법 3(Inverse Kinematics)'을 쓰고 싶다면
+    # 여기에 mdp.reset_joints_by_ik_solver 같은 커스텀 함수를 연결하면 됩니다.
 
 
 @configclass
 class TerminationsCfg:
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
     
-    # [안전장치] 로봇이 바닥(Z=0) 아래로 뚫고 내려가면 에피소드 종료
+    # [안전장치]
     underground_death = DoneTerm(
         func=mdp.root_height_below_minimum,
         params={"minimum_height": -0.05, "asset_cfg": SceneEntityCfg("robot")}
@@ -227,10 +235,9 @@ class RobotarmEnvCfg(ManagerBasedRLEnvCfg):
     def __post_init__(self) -> None:
         self.decimation = 4            
         self.episode_length_s = 15.0   
-        self.sim.dt = 1.0 / 120.0 # [안정화] 120Hz 물리 연산으로 터널링 방지
+        self.sim.dt = 1.0 / 120.0 
         self.sim.render_interval = self.decimation
         
-        # [PhysX 강화] 충돌 처리를 더 정밀하게
         self.sim.physx.bounce_threshold_velocity = 0.2
         self.sim.physx.enable_stabilization = True
         
