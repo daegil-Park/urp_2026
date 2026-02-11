@@ -11,6 +11,7 @@ import argparse
 import sys
 import os
 import random
+import pickle  # [수정 1] pickle 모듈 추가
 
 from isaaclab.app import AppLauncher
 
@@ -102,7 +103,8 @@ from isaaclab.envs import (
     multi_agent_to_single_agent,
 )
 from isaaclab.utils.dict import print_dict
-from isaaclab.utils.io import dump_pickle, dump_yaml
+# [수정 2] dump_pickle 제거 (위에서 import pickle 사용)
+from isaaclab.utils.io import dump_yaml
 from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 
 from isaaclab_rl.skrl import SkrlVecEnvWrapper
@@ -196,7 +198,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     
     if should_write:
         filename = os.path.join(log_root_path, "env_cfg.pickle")
-        dump_pickle(filename, env_cfg)
+        # [수정 3] dump_pickle -> pickle.dump 사용
+        with open(filename, "wb") as f:
+            pickle.dump(env_cfg, f)
+            
         filename = os.path.join(log_root_path, "experiment_cfg.yaml")
         dump_yaml(filename, experiment_cfg)
 
